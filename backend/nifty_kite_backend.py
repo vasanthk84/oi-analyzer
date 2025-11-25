@@ -30,6 +30,33 @@ try:
 except Exception as e:
     logger.error(f"Failed to initialize KiteConnect: {e}")
 
+# --- DATABASE INIT ---
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS nifty_ohlc (
+            date TEXT PRIMARY KEY,
+            open REAL,
+            high REAL,
+            low REAL,
+            close REAL,
+            vix REAL
+        )
+    ''')
+    cursor.execute("PRAGMA table_info(nifty_ohlc)")
+    columns = [info[1] for info in cursor.fetchall()]
+    if 'vix' not in columns:
+        try:
+            cursor.execute("ALTER TABLE nifty_ohlc ADD COLUMN vix REAL")
+            logger.info("Migrated DB: Added 'vix' column")
+        except Exception as e:
+            logger.error(f"DB Migration failed: {e}")
+    conn.commit()
+    conn.close()
+
+init_db()
+
 def get_ist_time():
     utc_now = datetime.now(pytz.utc)
     ist_tz = pytz.timezone('Asia/Kolkata')
@@ -64,8 +91,7 @@ try:
 except Exception as e:
     logger.warning(f"Initial refresh skipped: {e}")
 
-# ... (Keep Max Pain, Greeks, Historical, RSI Logic same as previous file - omitted to save space, assume they exist) ...
-# RE-INSERTING HELPER FUNCTIONS FOR COMPLETENESS TO AVOID ERRORS
+# --- CALCULATION HELPERS ---
 def calculate_max_pain(chain_df):
     strikes = chain_df['strike'].unique()
     strikes.sort()
@@ -114,6 +140,7 @@ def calculate_rsi(prices, period=14):
     seed = deltas[:period+1]
     up = seed[seed >= 0].sum()/period
     down = -seed[seed < 0].sum()/period
+    if down == 0: return 100
     rs = up/down
     rsi = np.zeros_like(prices)
     rsi[:period] = 100. - 100./(1. + rs)
@@ -128,6 +155,76 @@ def calculate_rsi(prices, period=14):
     return rsi[-1]
 
 def round50(n): return round(n / 50) * 50
+
+# --- INTELLIGENT SYSTEM LOGIC (NEW) ---
+
+def calculate_iv_rank(current_vix, df):
+    if df.empty or 'vix' not in df.columns or df['vix'].isnull().all():
+        return {"rank": 50, "status": "Neutral (No Data)"}
+    
+    vix_series = df['vix'].dropna()
+    if len(vix_series) < 10:
+        return {"rank": 50, "status": "Neutral (Low Data)"}
+
+    min_vix = vix_series.min()
+    max_vix = vix_series.max()
+    
+    if max_vix == min_vix: return {"rank": 50, "status": "Stable"}
+
+    rank = ((current_vix - min_vix) / (max_vix - min_vix)) * 100
+    
+    status = "Neutral"
+    if rank > 70: status = "High (Sell Opportunity)"
+    elif rank > 50: status = "Moderately High"
+    elif rank < 30: status = "Low (Premium Risk)"
+    
+    return {"rank": round(rank, 1), "status": status}
+
+def detect_market_regime(spot, df, vix_val, rsi_val):
+    if df.empty: return "Neutral", {"bias": "Neutral", "adjust_call": 1.0, "adjust_put": 1.0}
+
+    closes = pd.to_numeric(df['close'])
+    sma_20 = closes.head(20).mean()
+    trend_strength = ((spot - sma_20) / sma_20) * 100
+    high_vol =VX = vix_val > 18
+    
+    regime = "Neutral"
+    details = {"bias": "Neutral", "adjust_call": 1.0, "adjust_put": 1.0}
+
+    if high_vol:
+        regime = "High Volatility"
+        details = {"bias": "Volatile", "adjust_call": 1.15, "adjust_put": 1.15} 
+    elif trend_strength > 2 and rsi_val > 55:
+        regime = "Bullish Trend"
+        details = {"bias": "Bullish", "adjust_call": 1.25, "adjust_put": 0.9} 
+    elif trend_strength < -2 and rsi_val < 45:
+        regime = "Bearish Trend"
+        details = {"bias": "Bearish", "adjust_call": 0.9, "adjust_put": 1.25}
+    elif abs(trend_strength) < 1.5:
+        regime = "Range Bound"
+        details = {"bias": "Range", "adjust_call": 0.95, "adjust_put": 0.95}
+
+    return regime, details
+
+def get_dte_adjustment(days_to_expiry, vix_val):
+    if days_to_expiry == 0:
+        return 2.0, "⚠️ 0 DTE: Gamma Risk High"
+    elif days_to_expiry == 1:
+        return 1.3, "⚠️ 1 DTE: Caution"
+    elif vix_val < 11 and days_to_expiry > 4:
+         return 1.4, "Low VIX + Long Time"
+    return 1.0, "Standard Decay"
+
+def get_skew_adjustment(skew_val, pcr):
+    adj_call = 1.0
+    adj_put = 1.0
+    if skew_val > 1.2 and pcr > 1.2:
+        adj_call = 0.9
+        adj_put = 1.15
+    elif skew_val < 0.8 and pcr < 0.7:
+        adj_call = 1.15
+        adj_put = 0.9
+    return adj_call, adj_put
 
 def get_historical_buffers(spot, days_to_expiry):
     df = fetch_nifty_history_db()
@@ -147,43 +244,62 @@ def get_historical_buffers(spot, days_to_expiry):
             std_dev = stats_df['range'].std()
             max_range = stats_df['range'].max()
             sample_size = len(stats_df)
+    
     if sample_size == 0:
         straddle_proxy = spot * 0.01 
         avg_range = straddle_proxy * 0.8 
         max_range = straddle_proxy * 1.5
         std_dev = straddle_proxy * 0.2
+
+    # --- UPDATED LOGIC ---
+    # Conservative = 2 SD (95% Safety)
     cons_buffer = avg_range + (2 * std_dev)
+    
+    # Moderate = 1 SD (68% Safety)
     mod_buffer = avg_range + (1 * std_dev)
-    agg_buffer = avg_range                  
-    if days_to_expiry == 0: agg_buffer = max_range 
-    return { "conservative": cons_buffer, "moderate": mod_buffer, "aggressive": agg_buffer, "sample_size": sample_size, "avg_range": avg_range, "std_dev": std_dev }
+    
+    # Aggressive = Tighter than avg range to ensure premium
+    # Removed the 0 DTE override that forced it to max_range
+    agg_buffer = avg_range * 0.8 
+    
+    return { 
+        "conservative": cons_buffer, "moderate": mod_buffer, "aggressive": agg_buffer, 
+        "sample_size": sample_size, "avg_range": avg_range, "std_dev": std_dev 
+    }
+
+# --- ENDPOINTS ---
 
 @app.post("/update_daily_ohlc")
 def update_daily_ohlc():
     try:
-        quote = kite.quote(["NSE:NIFTY 50"])
-        ohlc = quote["NSE:NIFTY 50"]["ohlc"]
+        quote = kite.quote(["NSE:NIFTY 50", "NSE:INDIA VIX"])
+        nifty_ohlc = quote["NSE:NIFTY 50"]["ohlc"]
         current_price = quote["NSE:NIFTY 50"]["last_price"]
+        vix_price = quote.get("NSE:INDIA VIX", {}).get("last_price", 0)
+
         today_str = str(datetime.now().date())
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
-        cursor.execute('''INSERT OR REPLACE INTO nifty_ohlc (date, open, high, low, close) VALUES (?, ?, ?, ?, ?)''', (today_str, ohlc['open'], ohlc['high'], ohlc['low'], current_price))
+        cursor.execute('''
+            INSERT OR REPLACE INTO nifty_ohlc (date, open, high, low, close, vix) 
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (today_str, nifty_ohlc['open'], nifty_ohlc['high'], nifty_ohlc['low'], current_price, vix_price))
         conn.commit()
         conn.close()
-        return {"status": "success", "message": f"Saved Data for {today_str}: Close {current_price}"}
+        return {"status": "success", "message": f"Saved {today_str}: Spot {current_price}"}
     except Exception as e:
         logger.error(f"Daily Update Failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/historical_analysis")
 def get_historical_analysis():
-    # ... (Same as previous implementation, simplified here) ...
     try:
         today = datetime.now().date()
         expiry_today = get_next_expiry_date(today)
         days_to_expiry = (expiry_today - today).days
         quote_nifty = kite.quote(["NSE:NIFTY 50"])
         spot = quote_nifty["NSE:NIFTY 50"]["last_price"]
+        
         df = fetch_nifty_history_db()
         rsi_val = 50
         if not df.empty:
@@ -191,21 +307,25 @@ def get_historical_analysis():
             closes = df_sorted['close'].tolist()
             closes.append(spot)
             rsi_val = calculate_rsi(closes)
+            
         hist_data = get_historical_buffers(spot, days_to_expiry)
+        
         suggestions = {
             "conservative": { "call": round50(spot + hist_data["conservative"]), "put": round50(spot - hist_data["conservative"]), "prob_worthless": "High (Safe)" },
             "moderate": { "call": round50(spot + hist_data["moderate"]), "put": round50(spot - hist_data["moderate"]), "prob_worthless": "Medium" },
             "aggressive": { "call": round50(spot + hist_data["aggressive"]), "put": round50(spot - hist_data["aggressive"]), "prob_worthless": "Low (Risky)" }
         }
-        return { "dte": days_to_expiry, "source": f"Local DB ({hist_data['sample_size']})", "expiry_date": str(expiry_today), "rsi": round(rsi_val, 2), "sample_size": hist_data['sample_size'], "stats": { "avg_range": round(hist_data['avg_range'], 2), "std_dev": round(hist_data['std_dev'], 2) }, "suggestions": suggestions, "gamma_blast_risk": (days_to_expiry == 0) }
+        return { 
+            "dte": days_to_expiry, "source": f"Local DB ({hist_data['sample_size']})", "expiry_date": str(expiry_today), 
+            "rsi": round(rsi_val, 2), "sample_size": hist_data['sample_size'], 
+            "stats": { "avg_range": round(hist_data['avg_range'], 2), "std_dev": round(hist_data['std_dev'], 2) }, 
+            "suggestions": suggestions, "gamma_blast_risk": (days_to_expiry == 0) 
+        }
     except Exception as e:
         logger.error(f"History Analysis failed: {e}")
         return {"stats": {}, "suggestions": {"conservative":{}, "moderate":{}, "aggressive":{}}}
 
-# --- NEW: EXECUTION & POSITIONS ---
-
 def get_symbol_for_strike(strike, type_):
-    # Lookup symbol from cache
     for t, det in instrument_cache['strike_map'].items():
         if det['strike'] == strike and det['type'] == type_:
             return det['symbol']
@@ -213,68 +333,26 @@ def get_symbol_for_strike(strike, type_):
 
 @app.post("/execute_strangle")
 def execute_strangle(payload: dict = Body(...)):
-    """
-    Places 2 SELL orders (CE + PE) for the given strikes.
-    Payload: { "call_strike": 26200, "put_strike": 25800, "qty": 25 }
-    """
     try:
         call_strike = payload.get("call_strike")
         put_strike = payload.get("put_strike")
-        qty = payload.get("qty", 25) # Default 1 Lot
-
+        qty = payload.get("qty", 25)
         call_symbol = get_symbol_for_strike(call_strike, 'CE')
         put_symbol = get_symbol_for_strike(put_strike, 'PE')
-
-        if not call_symbol or not put_symbol:
-            raise HTTPException(status_code=400, detail="Invalid Strikes. Refresh Instruments.")
-
-        # Place Orders
-        # Note: Using VARIETY_REGULAR & MARKET for simplicity.
-        # In real prod, add margin checks and error handling per order.
-        
-        # 1. Sell Call
-        order_id_ce = kite.place_order(
-            tradingsymbol=call_symbol,
-            exchange=kite.EXCHANGE_NFO,
-            transaction_type=kite.TRANSACTION_TYPE_SELL,
-            quantity=qty,
-            order_type=kite.ORDER_TYPE_MARKET,
-            product=kite.PRODUCT_MIS,
-            variety=kite.VARIETY_REGULAR
-        )
-        
-        # 2. Sell Put
-        order_id_pe = kite.place_order(
-            tradingsymbol=put_symbol,
-            exchange=kite.EXCHANGE_NFO,
-            transaction_type=kite.TRANSACTION_TYPE_SELL,
-            quantity=qty,
-            order_type=kite.ORDER_TYPE_MARKET,
-            product=kite.PRODUCT_MIS,
-            variety=kite.VARIETY_REGULAR
-        )
-
-        return {
-            "status": "success", 
-            "message": f"Orders Placed. IDs: {order_id_ce}, {order_id_pe}",
-            "executed_strikes": {"call": call_strike, "put": put_strike}
-        }
-
+        if not call_symbol or not put_symbol: raise HTTPException(status_code=400, detail="Invalid Strikes. Refresh Instruments.")
+        order_id_ce = kite.place_order(tradingsymbol=call_symbol, exchange=kite.EXCHANGE_NFO, transaction_type=kite.TRANSACTION_TYPE_SELL, quantity=qty, order_type=kite.ORDER_TYPE_MARKET, product=kite.PRODUCT_MIS, variety=kite.VARIETY_REGULAR)
+        order_id_pe = kite.place_order(tradingsymbol=put_symbol, exchange=kite.EXCHANGE_NFO, transaction_type=kite.TRANSACTION_TYPE_SELL, quantity=qty, order_type=kite.ORDER_TYPE_MARKET, product=kite.PRODUCT_MIS, variety=kite.VARIETY_REGULAR)
+        return {"status": "success", "message": f"Orders Placed. IDs: {order_id_ce}, {order_id_pe}", "executed_strikes": {"call": call_strike, "put": put_strike}}
     except Exception as e:
         logger.error(f"Execution Failed: {e}")
-        # Return 200 with error status to handle gracefully in UI
         return {"status": "error", "message": str(e)} 
 
 @app.get("/positions")
 def get_positions():
-    """Fetches Net Positions from Kite"""
     try:
         positions = kite.positions()
         net = positions['net']
-        
-        # Filter for NIFTY only to keep dashboard clean
         nifty_positions = [p for p in net if 'NIFTY' in p['tradingsymbol']]
-        
         return {"data": nifty_positions}
     except Exception as e:
         logger.error(f"Positions fetch failed: {e}")
@@ -282,7 +360,6 @@ def get_positions():
 
 @app.get("/analyze")
 def get_analysis():
-    # ... (Keep existing analyze logic exactly as is) ...
     if not instrument_cache["nifty_tokens"]:
         refresh_instruments()
         if not instrument_cache["nifty_tokens"]: raise HTTPException(status_code=500, detail="Instruments not loaded.")
@@ -304,10 +381,23 @@ def get_analysis():
         atm_strike = round(nifty_spot / 50) * 50
         atm_greeks = calculate_greeks(nifty_spot, atm_strike, time_to_expiry_years, risk_free_rate, sigma, 'CE')
         
+        hist_df = fetch_nifty_history_db()
+        hist_data = get_historical_buffers(nifty_spot, days_to_expiry)
+        
+        iv_rank_data = calculate_iv_rank(vix_val, hist_df)
+        
+        rsi_val = 50
+        if not hist_df.empty:
+            closes = hist_df.sort_values(by='date')['close'].tolist()
+            closes.append(nifty_spot)
+            rsi_val = calculate_rsi(closes)
+            
+        regime_name, regime_details = detect_market_regime(nifty_spot, hist_df, vix_val, rsi_val)
+        dte_mult, dte_msg = get_dte_adjustment(days_to_expiry, vix_val)
+        
+        max_buffer = (hist_data["conservative"] * 1.5) + 300 
         relevant_tokens = []
         token_details = []
-        hist_data = get_historical_buffers(nifty_spot, days_to_expiry)
-        max_buffer = hist_data["conservative"] + 200 
         skew_up_strike = atm_strike + 500
         skew_down_strike = atm_strike - 500
         
@@ -335,33 +425,85 @@ def get_analysis():
         df = pd.DataFrame(data)
         ce_df = df[df['type'] == 'CE'].set_index('strike')
         pe_df = df[df['type'] == 'PE'].set_index('strike')
+
+        volatility_skew = skew_put_price / skew_call_price if skew_call_price > 0 else 0
+        pcr = round(pe_df['oi'].sum() / ce_df['oi'].sum(), 2) if ce_df['oi'].sum() > 0 else 0
+        skew_adj_call, skew_adj_put = get_skew_adjustment(volatility_skew, pcr)
+
+        # --- UPDATED IV RANK MULTIPLIER ---
+        iv_rank_mult = 1.0
+        # High IV: Can go wider (Safe) and still get premium
+        if iv_rank_data["rank"] > 50: iv_rank_mult = 1.1 
+        # Low IV: Premiums are low. Conservative wants safety (Wider), Aggressive wants premium (Tighter).
+        elif iv_rank_data["rank"] < 30: iv_rank_mult = 1.2 # Base safety widening
         
-        def get_profile_data(call_k, put_k):
+        def get_profile_data(base_buffer, profile_name):
+            call_dist = base_buffer
+            put_dist = base_buffer
+            
+            call_dist *= regime_details["adjust_call"]
+            put_dist *= regime_details["adjust_put"]
+            
+            call_dist *= skew_adj_call
+            put_dist *= skew_adj_put
+            
+            # --- UPDATED SAFETY APPLICATION ---
+            safety_factor = iv_rank_mult * dte_mult
+            
+            if profile_name == "aggressive":
+                # Aggressive Logic:
+                # 1. Ignore excessive safety padding (reduce impact by 80%)
+                if safety_factor > 1.0:
+                    safety_factor = 1.0 + (safety_factor - 1.0) * 0.2
+                
+                # 2. If Low IV (<30), TIGHTEN further to find premium
+                # (Overriding the base safety widening)
+                if iv_rank_data["rank"] < 30:
+                    safety_factor *= 0.85 
+
+            elif profile_name == "moderate":
+                # Moderate Logic: Partial safety (reduce impact by 40%)
+                if safety_factor > 1.0:
+                    safety_factor = 1.0 + (safety_factor - 1.0) * 0.6
+            
+            # Conservative Logic: Accepts full safety factor (Safest, Lowest Premium)
+
+            call_dist *= safety_factor
+            put_dist *= safety_factor
+            
+            call_k = round50(nifty_spot + call_dist)
+            put_k = round50(nifty_spot - put_dist)
+
             c_ltp = ce_df.loc[call_k]['ltp'] if call_k in ce_df.index else 0
             p_ltp = pe_df.loc[put_k]['ltp'] if put_k in pe_df.index else 0
             c_greeks = calculate_greeks(nifty_spot, call_k, time_to_expiry_years, risk_free_rate, sigma, 'CE')
             p_greeks = calculate_greeks(nifty_spot, put_k, time_to_expiry_years, risk_free_rate, sigma, 'PE')
+            
             def get_stats(df, k):
                 if k in df.index:
                     r = df.loc[k]
                     return { "ok": bool(r['liquidity_ok']), "buy_qty": int(r['buy_qty']), "sell_qty": int(r['sell_qty']) }
                 return { "ok": False, "buy_qty": 0, "sell_qty": 0 }
-            return { "rec_call": float(call_k), "rec_put": float(put_k), "est_credit": float(c_ltp + p_ltp), "call_stats": get_stats(ce_df, call_k), "put_stats": get_stats(pe_df, put_k), "call_greeks": c_greeks, "put_greeks": p_greeks }
+                
+            return { 
+                "rec_call": float(call_k), "rec_put": float(put_k), 
+                "est_credit": float(c_ltp + p_ltp), 
+                "call_stats": get_stats(ce_df, call_k), "put_stats": get_stats(pe_df, put_k), 
+                "call_greeks": c_greeks, "put_greeks": p_greeks 
+            }
 
         profiles = {
-            "conservative": get_profile_data(round50(nifty_spot + hist_data["conservative"]), round50(nifty_spot - hist_data["conservative"])),
-            "moderate": get_profile_data(round50(nifty_spot + hist_data["moderate"]), round50(nifty_spot - hist_data["moderate"])),
-            "aggressive": get_profile_data(round50(nifty_spot + hist_data["aggressive"]), round50(nifty_spot - hist_data["aggressive"]))
+            "conservative": get_profile_data(hist_data["conservative"], "conservative"),
+            "moderate": get_profile_data(hist_data["moderate"], "moderate"),
+            "aggressive": get_profile_data(hist_data["aggressive"], "aggressive")
         }
         
         atm_ce_ltp = ce_df.loc[atm_strike]['ltp'] if atm_strike in ce_df.index else 0
         atm_pe_ltp = pe_df.loc[atm_strike]['ltp'] if atm_strike in pe_df.index else 0
         straddle_cost = atm_ce_ltp + atm_pe_ltp
-        volatility_skew = skew_put_price / skew_call_price if skew_call_price > 0 else 0
         max_pain = calculate_max_pain(df)
         res_strike = ce_df['oi'].idxmax()
         sup_strike = pe_df['oi'].idxmax()
-        pcr = round(pe_df['oi'].sum() / ce_df['oi'].sum(), 2) if ce_df['oi'].sum() > 0 else 0
         
         combined_idx = sorted(list(set(ce_df.index) | set(pe_df.index)))
         chart_data = {
@@ -373,11 +515,29 @@ def get_analysis():
         }
         
         return {
-            "timestamp": get_ist_time().strftime("%H:%M:%S"), "nifty_spot": nifty_spot, "vix": {"value": float(vix_val), "change": float(quote_vix.get("net_change", 0))}, "greeks": atm_greeks, "skew": { "value": round(volatility_skew, 2), "put_price": skew_put_price, "call_price": skew_call_price }, "metrics": { "max_pain": float(max_pain), "pcr": pcr, "support": float(sup_strike), "resistance": float(res_strike) }, "strangle_intel": profiles, "straddle_intel": { "atm_strike": float(atm_strike), "cost": float(straddle_cost), "upper_be": float(atm_strike+straddle_cost), "lower_be": float(atm_strike-straddle_cost) }, "chart_data": chart_data
+            "timestamp": get_ist_time().strftime("%H:%M:%S"), 
+            "nifty_spot": nifty_spot, 
+            "vix": {"value": float(vix_val), "change": float(quote_vix.get("net_change", 0))}, 
+            "greeks": atm_greeks, 
+            "skew": { "value": round(volatility_skew, 2), "put_price": skew_put_price, "call_price": skew_call_price }, 
+            "metrics": { "max_pain": float(max_pain), "pcr": pcr, "support": float(sup_strike), "resistance": float(res_strike) }, 
+            "strangle_intel": profiles, 
+            "straddle_intel": { "atm_strike": float(atm_strike), "cost": float(straddle_cost), "upper_be": float(atm_strike+straddle_cost), "lower_be": float(atm_strike-straddle_cost) }, 
+            "chart_data": chart_data,
+            "market_intel": {
+                "regime": regime_name,
+                "regime_bias": regime_details["bias"],
+                "iv_rank": iv_rank_data["rank"],
+                "iv_status": iv_rank_data["status"],
+                "dte_msg": dte_msg,
+                "rsi": round(rsi_val, 1)
+            }
         }
         
     except Exception as e:
         logger.error(f"Analysis failed: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":

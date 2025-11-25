@@ -31,6 +31,10 @@ const getHtml = () => `
         .flow-bar { height: 4px; width: 100%; background: #334155; border-radius: 2px; overflow: hidden; display: flex; margin-top: 4px; }
         .flow-buy { background: #4ade80; height: 100%; }
         .flow-sell { background: #f87171; height: 100%; }
+        
+        /* New Intel Animations */
+        @keyframes pulse-soft { 0% { opacity: 0.8; } 50% { opacity: 1; } 100% { opacity: 0.8; } }
+        .live-dot { height: 6px; width: 6px; border-radius: 50%; display: inline-block; margin-right: 4px; animation: pulse-soft 2s infinite; }
     </style>
 </head>
 <body class="p-4 md:p-8 max-w-7xl mx-auto pb-20">
@@ -38,7 +42,7 @@ const getHtml = () => `
     <!-- Header -->
     <div class="flex justify-between items-center mb-6">
         <div>
-            <h1 class="text-3xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-indigo-400 to-cyan-400">OPTION MASTER</h1>
+            <h1 class="text-3xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-indigo-400 to-cyan-400">OPTION MASTER <span class="text-xs text-slate-500 bg-slate-800 px-2 py-1 rounded ml-2">AI ENHANCED</span></h1>
             <p class="text-slate-400 text-sm">Exec Intelligence & Risk Management</p>
         </div>
         <div class="flex items-center gap-6">
@@ -50,15 +54,33 @@ const getHtml = () => `
                 <div class="flex items-center justify-end gap-2 has-tooltip relative cursor-help">
                     <span class="stat-label">Nifty Spot</span>
                     <span id="rsi-badge" class="text-xs px-2 py-0.5 rounded font-bold bg-slate-700 text-slate-400">RSI --</span>
-                    <div class="tooltip text-left">
-                        <strong class="block text-white mb-2 border-b border-slate-600 pb-1">RSI Strategy Guide</strong>
-                        <div class="space-y-2">
-                            <div class="flex justify-between"><span class="text-green-400 font-bold">40-60</span> <span class="text-slate-300">Ranging (Safe)</span></div>
-                            <div class="flex justify-between"><span class="text-red-400 font-bold">> 70</span> <span class="text-slate-300">Overbought</span></div>
-                            <div class="flex justify-between"><span class="text-blue-400 font-bold">< 30</span> <span class="text-slate-300">Oversold</span></div>
-                        </div>
-                    </div>
                 </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- MARKET INTEL PANEL (NEW) -->
+    <div class="glass-panel p-3 rounded-xl border-l-4 border-indigo-500 mb-6 bg-slate-800/50">
+        <div class="flex justify-between items-center flex-wrap gap-4">
+            <div class="flex items-center gap-4">
+                <div>
+                    <div class="stat-label text-indigo-300">Market Regime</div>
+                    <div class="font-bold text-white flex items-center" id="regime-val">--</div>
+                </div>
+                <div class="h-8 w-px bg-slate-700"></div>
+                <div>
+                    <div class="stat-label text-indigo-300">IV Rank</div>
+                    <div class="font-bold text-white" id="iv-rank-val">--</div>
+                </div>
+                <div class="h-8 w-px bg-slate-700"></div>
+                <div>
+                    <div class="stat-label text-indigo-300">Strategic Bias</div>
+                    <div class="text-xs text-slate-300 max-w-xs" id="strategy-msg">Initializing...</div>
+                </div>
+            </div>
+            <div class="text-right">
+                <div class="stat-label text-indigo-300">DTE Signal</div>
+                <div class="text-xs font-mono text-yellow-400" id="dte-signal">--</div>
             </div>
         </div>
     </div>
@@ -89,7 +111,7 @@ const getHtml = () => `
 
     <!-- STRANGLE SECTION -->
     <div class="flex justify-between items-center mb-3 px-1">
-        <h2 class="text-slate-400 text-xs font-bold uppercase tracking-widest">Strangle (Range) Setup</h2>
+        <h2 class="text-slate-400 text-xs font-bold uppercase tracking-widest">Smart Strangle Setup (Regime Adjusted)</h2>
         
         <!-- RISK PROFILE TOGGLE -->
         <div class="bg-slate-800 p-1 rounded-lg flex">
@@ -309,6 +331,7 @@ const getHtml = () => `
                     document.getElementById(\`hist-put-\${type}\`).innerText = data.suggestions[key].put;
                 });
 
+                // RSI BADGE LOGIC
                 const rsiEl = document.getElementById('rsi-badge');
                 if(data.rsi) {
                     rsiEl.innerText = "RSI " + data.rsi;
@@ -334,11 +357,9 @@ const getHtml = () => `
 
             const liqCall = intel.call_stats?.ok;
             document.getElementById('liq-call-msg').innerText = liqCall ? "Liquid" : "Low Vol";
-            document.getElementById('liq-call').className = liqCall ? "w-2 h-2 rounded-full bg-green-500 shadow-green-500/50 shadow-lg" : "w-2 h-2 rounded-full bg-red-500 animate-pulse";
             
             const liqPut = intel.put_stats?.ok;
             document.getElementById('liq-put-msg').innerText = liqPut ? "Liquid" : "Low Vol";
-            document.getElementById('liq-put').className = liqPut ? "w-2 h-2 rounded-full bg-green-500 shadow-green-500/50 shadow-lg" : "w-2 h-2 rounded-full bg-red-500 animate-pulse";
 
             const totalCall = (intel.call_stats?.buy_qty || 0) + (intel.call_stats?.sell_qty || 0);
             if(totalCall > 0) {
@@ -404,7 +425,12 @@ const getHtml = () => `
                     tbody.innerHTML = '<tr><td colspan="5" class="px-4 py-3 text-center text-slate-500">No open positions</td></tr>';
                 } else {
                     positions.forEach(pos => {
-                        const mtm = pos.m2m || 0;
+                        // MANUAL P&L CALCULATION (Real-time Accuracy)
+                        // Formula: (Last Price - Average Price) * Quantity
+                        // Works for both Buy (Qty > 0) and Sell (Qty < 0)
+                        // E.g., Sell: (38 - 25.5) * -75 = 12.5 * -75 = -937.5 (Loss) -> Correct
+                        const mtm = (pos.last_price - pos.average_price) * pos.quantity;
+                        
                         totalMtm += mtm;
                         const row = \`
                             <tr class="border-b border-slate-800 hover:bg-slate-800/30 transition">
@@ -444,6 +470,32 @@ const getHtml = () => `
                     oiChart.data.datasets[2].data = data.chart_data.ce_vol;
                     oiChart.data.datasets[3].data = data.chart_data.pe_vol;
                     oiChart.update('none');
+                }
+                
+                // NEW: Render Market Intel
+                if(data.market_intel) {
+                    const regimeEl = document.getElementById('regime-val');
+                    const r = data.market_intel.regime;
+                    
+                    let rColor = "text-white";
+                    if(r.includes("Bullish")) rColor = "text-green-400";
+                    else if(r.includes("Bearish")) rColor = "text-red-400";
+                    else if(r.includes("Volatile")) rColor = "text-orange-400";
+                    
+                    regimeEl.innerHTML = \`<span class="live-dot bg-green-500"></span><span class="\${rColor}">\${r}</span>\`;
+                    
+                    const ivEl = document.getElementById('iv-rank-val');
+                    ivEl.innerText = data.market_intel.iv_rank + " (" + data.market_intel.iv_status.split(' ')[0] + ")";
+                    
+                    document.getElementById('strategy-msg').innerText = data.market_intel.regime_bias + " Bias | " + data.market_intel.dte_msg;
+                    document.getElementById('dte-signal').innerText = data.market_intel.dte_msg.includes("Standard") ? "Standard" : "Risk Alert";
+                    
+                    // Update RSI badge from Live Data
+                    const rsiEl = document.getElementById('rsi-badge');
+                    rsiEl.innerText = "RSI " + data.market_intel.rsi;
+                    if(data.market_intel.rsi > 70) rsiEl.className = "text-xs px-2 py-0.5 rounded font-bold bg-red-900 text-red-300";
+                    else if(data.market_intel.rsi < 30) rsiEl.className = "text-xs px-2 py-0.5 rounded font-bold bg-green-900 text-green-300";
+                    else rsiEl.className = "text-xs px-2 py-0.5 rounded font-bold bg-slate-700 text-slate-300";
                 }
 
                 document.getElementById('spot-price').innerText = data.nifty_spot?.toFixed(2) ?? '--';

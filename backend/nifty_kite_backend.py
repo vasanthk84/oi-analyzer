@@ -154,7 +154,12 @@ def calculate_rsi(prices, period=14):
         rsi[i] = 100. - 100./(1. + rs)
     return rsi[-1]
 
-def round50(n): return round(n / 50) * 50
+def round50(n): 
+    try:
+        if math.isnan(n): return 0
+        return round(n / 50) * 50
+    except:
+        return 0
 
 # --- INTELLIGENT SYSTEM LOGIC (NEW) ---
 
@@ -241,7 +246,11 @@ def get_historical_buffers(spot, days_to_expiry):
         if relevant_moves:
             stats_df = pd.DataFrame(relevant_moves)
             avg_range = stats_df['range'].mean()
-            std_dev = stats_df['range'].std()
+            # Fix: Handle case with single data point (std returns NaN)
+            if len(stats_df) > 1:
+                std_dev = stats_df['range'].std()
+            else:
+                std_dev = avg_range * 0.2 # Fallback
             max_range = stats_df['range'].max()
             sample_size = len(stats_df)
     
@@ -252,6 +261,10 @@ def get_historical_buffers(spot, days_to_expiry):
         std_dev = straddle_proxy * 0.2
 
     # --- UPDATED LOGIC ---
+    # Ensure no NaN values propagate
+    if math.isnan(avg_range): avg_range = spot * 0.01
+    if math.isnan(std_dev): std_dev = avg_range * 0.2
+
     # Conservative = 2 SD (95% Safety)
     cons_buffer = avg_range + (2 * std_dev)
     
@@ -259,7 +272,6 @@ def get_historical_buffers(spot, days_to_expiry):
     mod_buffer = avg_range + (1 * std_dev)
     
     # Aggressive = Tighter than avg range to ensure premium
-    # Removed the 0 DTE override that forced it to max_range
     agg_buffer = avg_range * 0.8 
     
     return { 
@@ -323,7 +335,12 @@ def get_historical_analysis():
         }
     except Exception as e:
         logger.error(f"History Analysis failed: {e}")
-        return {"stats": {}, "suggestions": {"conservative":{}, "moderate":{}, "aggressive":{}}}
+        # Fix: Return placeholders instead of empty dict to prevent 'undefined' in UI
+        err_struct = {"call": "--", "put": "--", "prob_worthless": "Error"}
+        return {
+            "stats": {}, 
+            "suggestions": {"conservative": err_struct, "moderate": err_struct, "aggressive": err_struct}
+        }
 
 def get_symbol_for_strike(strike, type_):
     for t, det in instrument_cache['strike_map'].items():

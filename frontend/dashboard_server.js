@@ -187,10 +187,20 @@ const getHtml = () => `
          <div class="relative h-48 w-full"><canvas id="strangleChart"></canvas></div>
     </div>
 
-    <!-- LIVE POSITIONS TABLE -->
+    <!-- LIVE POSITIONS TABLE (TOGGLEABLE) -->
     <div class="mb-8">
-        <h3 class="text-slate-400 text-xs font-bold uppercase tracking-widest mb-2 px-1">Live Positions (MTM)</h3>
-        <div class="glass-panel rounded-xl overflow-hidden">
+        <div class="flex justify-between items-center mb-2 px-1">
+            <h3 class="text-slate-400 text-xs font-bold uppercase tracking-widest">Live Positions (MTM)</h3>
+            <div class="flex items-center">
+                <span class="mr-2 text-xs text-slate-400">Show</span>
+                <div class="relative inline-block w-10 h-6 align-middle select-none transition duration-200 ease-in">
+                    <input type="checkbox" name="togglePositions" id="positions-toggle" class="toggle-checkbox absolute block w-6 h-6 rounded-full bg-white border-4 appearance-none cursor-pointer" onclick="togglePositions()" checked />
+                    <label for="positions-toggle" class="toggle-label block overflow-hidden h-6 rounded-full bg-gray-600 cursor-pointer"></label>
+                </div>
+            </div>
+        </div>
+        
+        <div id="positions-container" class="glass-panel rounded-xl overflow-hidden transition-all duration-300">
             <table class="w-full text-sm text-left text-slate-400">
                 <thead class="text-xs text-slate-300 uppercase bg-slate-700">
                     <tr>
@@ -310,6 +320,20 @@ const getHtml = () => `
 
         function toggleStraddleChart() { const c = document.getElementById('premium-chart-container'); const cb = document.getElementById('chart-toggle'); cb.checked ? c.classList.remove('hidden') : c.classList.add('hidden'); }
         function toggleStrangleChart() { const c = document.getElementById('strangle-premium-chart-container'); const cb = document.getElementById('strangle-chart-toggle'); cb.checked ? c.classList.remove('hidden') : c.classList.add('hidden'); }
+        
+        function togglePositions() {
+            const container = document.getElementById('positions-container');
+            const cb = document.getElementById('positions-toggle');
+            if(cb.checked) {
+                container.style.maxHeight = '500px'; 
+                container.style.opacity = '1';
+                container.classList.remove('hidden');
+            } else {
+                container.style.maxHeight = '0px';
+                container.style.opacity = '0';
+                setTimeout(() => container.classList.add('hidden'), 300); // Wait for transition
+            }
+        }
 
         async function saveDailyData() {
             const btn = document.getElementById('save-btn'); btn.innerText = "Saving...";
@@ -581,6 +605,7 @@ const getHtml = () => `
         fetchHistory();
         toggleStraddleChart();
         toggleStrangleChart();
+        togglePositions(); // Initialize toggle state
         setInterval(() => updateDashboard(false), 2000);
     </script>
 </body>

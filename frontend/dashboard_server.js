@@ -35,24 +35,12 @@ const getHtml = () => `
         /* New Intel Animations */
         @keyframes pulse-soft { 0% { opacity: 0.8; } 50% { opacity: 1; } 100% { opacity: 0.8; } }
         .live-dot { height: 6px; width: 6px; border-radius: 50%; display: inline-block; margin-right: 4px; animation: pulse-soft 2s infinite; }
-        
-        /* Signal Banner Animation */
-        @keyframes slide-down { 0% { transform: translateY(-100%); } 100% { transform: translateY(0); } }
-        .signal-banner { animation: slide-down 0.5s ease-out; }
-        @keyframes flash-green { 0% { background-color: rgba(34, 197, 94, 0.9); } 50% { background-color: rgba(21, 128, 61, 0.9); } 100% { background-color: rgba(34, 197, 94, 0.9); } }
-        .flash-bg { animation: flash-green 2s infinite; }
     </style>
 </head>
 <body class="p-4 md:p-8 max-w-7xl mx-auto pb-20">
 
-    <!-- SIGNAL BANNER (Hidden by Default) -->
-    <div id="signal-banner" class="hidden fixed top-0 left-0 right-0 z-50 p-4 text-center text-white font-bold shadow-xl signal-banner flash-bg cursor-pointer" onclick="this.classList.add('hidden')">
-        🚀 ENTRY SIGNAL DETECTED: <span id="signal-reason">--</span>
-        <div class="text-xs font-normal opacity-80 mt-1">Click to dismiss</div>
-    </div>
-
     <!-- Header -->
-    <div class="flex justify-between items-center mb-6 mt-2">
+    <div class="flex justify-between items-center mb-6">
         <div>
             <h1 class="text-3xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-indigo-400 to-cyan-400">OPTION MASTER <span class="text-xs text-slate-500 bg-slate-800 px-2 py-1 rounded ml-2">AI ENHANCED</span></h1>
             <p class="text-slate-400 text-sm">Exec Intelligence & Risk Management</p>
@@ -91,8 +79,8 @@ const getHtml = () => `
                 </div>
             </div>
             <div class="text-right">
-                <div class="stat-label text-indigo-300">IV Source</div>
-                <div class="text-xs font-mono text-cyan-400" id="iv-source">--</div>
+                <div class="stat-label text-indigo-300">DTE Signal</div>
+                <div class="text-xs font-mono text-yellow-400" id="dte-signal">--</div>
             </div>
         </div>
     </div>
@@ -141,10 +129,10 @@ const getHtml = () => `
         <div class="glass-panel p-6 rounded-2xl border-t-4 border-red-500 relative">
             <div class="flex justify-between items-start">
                 <div><div class="stat-label">Rec. Short Call</div><div class="text-3xl font-bold text-white" id="rec-call">--</div></div>
-                <div class="text-right"><div class="text-[10px] text-slate-400">Î” <span class="text-white" id="call-delta">--</span></div><div class="text-[10px] text-slate-400">Î˜ <span class="text-green-400" id="call-theta">--</span></div></div>
+                <div class="text-right"><div class="text-[14px] text-slate-400"> Δ <span class="text-white" id="call-delta">--</span></div><div class="text-[14px] text-slate-400">θ <span class="text-green-400" id="call-theta">--</span></div></div>
             </div>
             <div class="mt-3 border-t border-slate-700 pt-2">
-                <div class="flex justify-between text-[10px] text-slate-400 mb-1"><span>Order Flow</span><span id="liq-call-msg">Checking...</span></div>
+                <div class="flex justify-between text-[14px] text-slate-400 mb-1"><span>Order Flow</span><span id="liq-call-msg">Checking...</span></div>
                 <div class="flow-bar"><div id="flow-call-buy" class="flow-buy" style="width: 50%"></div><div id="flow-call-sell" class="flow-sell" style="width: 50%"></div></div>
             </div>
         </div>
@@ -174,10 +162,10 @@ const getHtml = () => `
         <div class="glass-panel p-6 rounded-2xl border-t-4 border-green-500 relative">
             <div class="flex justify-between items-start">
                 <div><div class="stat-label">Rec. Short Put</div><div class="text-3xl font-bold text-white" id="rec-put">--</div></div>
-                <div class="text-right"><div class="text-[10px] text-slate-400">Î” <span class="text-white" id="put-delta">--</span></div><div class="text-[10px] text-slate-400">Î˜ <span class="text-green-400" id="put-theta">--</span></div></div>
+                <div class="text-right"><div class="text-[14px] text-slate-400">Δ  <span class="text-white" id="put-delta">--</span></div><div class="text-[14px] text-slate-400">θ <span class="text-green-400" id="put-theta">--</span></div></div>
             </div>
             <div class="mt-3 border-t border-slate-700 pt-2">
-                <div class="flex justify-between text-[10px] text-slate-400 mb-1"><span>Order Flow</span><span id="liq-put-msg">Checking...</span></div>
+                <div class="flex justify-between text-[14px] text-slate-400 mb-1"><span>Order Flow</span><span id="liq-put-msg">Checking...</span></div>
                 <div class="flow-bar"><div id="flow-put-buy" class="flow-buy" style="width: 50%"></div><div id="flow-put-sell" class="flow-sell" style="width: 50%"></div></div>
             </div>
         </div>
@@ -508,7 +496,7 @@ const getHtml = () => `
                     oiChart.update('none');
                 }
                 
-                // NEW: Render Market Intel & Signal
+                // NEW: Render Market Intel
                 if(data.market_intel) {
                     const regimeEl = document.getElementById('regime-val');
                     const r = data.market_intel.regime;
@@ -525,17 +513,6 @@ const getHtml = () => `
                     
                     document.getElementById('strategy-msg').innerText = data.market_intel.regime_bias + " Bias | " + data.market_intel.dte_msg;
                     document.getElementById('dte-signal').innerText = data.market_intel.dte_msg.includes("Standard") ? "Standard" : "Risk Alert";
-                    
-                    document.getElementById('iv-source').innerText = data.market_intel.iv_source || "VIX Proxy";
-                    
-                    // SIGNAL BANNER
-                    const banner = document.getElementById('signal-banner');
-                    if (data.market_intel.signal === "ENTER") {
-                        banner.classList.remove('hidden');
-                        document.getElementById('signal-reason').innerText = data.market_intel.signal_reason;
-                    } else {
-                        banner.classList.add('hidden');
-                    }
                     
                     // Update RSI badge from Live Data
                     const rsiEl = document.getElementById('rsi-badge');

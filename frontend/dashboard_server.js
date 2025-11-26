@@ -401,7 +401,7 @@ const getHtml = () => `
             const currentCost = intel.est_credit;
             if(initialStranglePremium === null) initialStranglePremium = currentCost;
             const stDiff = initialStranglePremium - currentCost;
-            const stPnl = stDiff * 25;
+            const stPnl = stDiff * 75; // Changed to 75 as per user request (1 Lot)
             const stPnlEl = document.getElementById('strangle-pnl');
             stPnlEl.innerText = (stPnl >= 0 ? "+" : "") + "" + stPnl.toFixed(0);
             stPnlEl.className = stPnl >= 0 ? "text-xs font-mono mb-3 text-green-400 font-bold" : "text-xs font-mono mb-3 text-red-400 font-bold";
@@ -413,7 +413,8 @@ const getHtml = () => `
             if (!globalData || !globalData.strangle_intel) return;
             
             const intel = globalData.strangle_intel[currentProfile];
-            if (!confirm(\`EXECUTE STRANGLE (1 Lot)?\\n\\nSell Call: \${intel.rec_call}\\nSell Put: \${intel.rec_put}\\n\\nProceed?\`)) return;
+            // Updated ALERT message to reflect 75 Qty
+            if (!confirm(\`EXECUTE STRANGLE (1 Lot - 75 Qty)?\\n\\nSell Call: \${intel.rec_call}\\nSell Put: \${intel.rec_put}\\n\\nProceed?\`)) return;
             
             try {
                 const res = await fetch('/execute_strangle', {
@@ -422,7 +423,7 @@ const getHtml = () => `
                     body: JSON.stringify({
                         call_strike: intel.rec_call,
                         put_strike: intel.rec_put,
-                        qty: 25
+                        qty: 75 // CHANGED: Set to 75 as per user request
                     })
                 });
                 const result = await res.json();
@@ -565,7 +566,7 @@ const getHtml = () => `
                         const straddleCost = data.straddle_intel.cost;
                         if(initialStraddlePremium === null) initialStraddlePremium = straddleCost;
                         const sDiff = initialStraddlePremium - straddleCost;
-                        const sPnl = sDiff * 25;
+                        const sPnl = sDiff * 75; // Changed to 75 for Nifty PnL calc
                         const sPnlEl = document.getElementById('straddle-pnl');
                         sPnlEl.innerText = (sPnl >= 0 ? "+" : "") + "" + sPnl.toFixed(0);
                         sPnlEl.className = sPnl >= 0 ? "text-xs mt-1 font-mono text-green-400" : "text-xs mt-1 font-mono text-red-400";
@@ -577,7 +578,8 @@ const getHtml = () => `
                             straddleHistory.labels.push(istTimeStr.substring(0, 5));
                             straddleHistory.data.push(straddleCost);
 
-                            if(strangleHistory.labels.length > 60) {
+                            // CHANGED: Increased buffer from 60 to 120 to show ~2 hours of data
+                            if(strangleHistory.labels.length > 120) {
                                 strangleHistory.labels.shift(); strangleHistory.data.shift();
                                 straddleHistory.labels.shift(); straddleHistory.data.shift();
                             }

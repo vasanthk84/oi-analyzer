@@ -11,6 +11,10 @@ import sqlite3
 import math
 from dotenv import load_dotenv
 
+from fastapi.responses import StreamingResponse
+import asyncio
+from fastapi.middleware.cors import CORSMiddleware
+
 # --- CONFIGURATION ---
 load_dotenv()
 
@@ -57,6 +61,206 @@ def init_db():
 
 init_db()
 
+# ============================================
+# REAL-TIME POSITION STREAMING (SSE)
+# ============================================
+
+@app.get("/positions/stream")
+async def stream_positions():
+    """
+    Server-Sent Events endpoint for real-time position updates.
+    Updates every 1 second. No more polling needed!
+    """
+    async def event_generator():
+        try:
+            while True:
+                # Fetch positions from Kite
+                positions_data = kite.positions()
+                net = positions_data['net']
+                nifty_positions = [p for p in net if 'NIFTY' in p['tradingsymbol']]
+                
+                # Calculate real-time MTM
+                total_mtm = 0
+                for pos in nifty_positions:
+                    # CRITICAL: Correct MTM formula
+                    # For SELL positions (qty < 0): MTM = (AvgPrice - LTP) * |Qty|
+                    # For BUY positions (qty > 0): MTM = (LTP - AvgPrice) * Qty
+                    mtm = (pos['last_price'] - pos['average_price']) * pos['quantity']
+                    pos['mtm'] = round(mtm, 2)
+                    total_mtm += mtm
+                
+                # Stream as Server-Sent Event
+                data = {
+                    "positions": nifty_positions,
+                    "total_mtm": round(total_mtm, 2),
+                    "timestamp": get_ist_time().strftime("%H:%M:%S")
+                }
+                
+                yield f"data: {json.dumps(data)}\n\n"
+                
+                # Update every 1 second
+                await asyncio.sleep(1)
+                
+        except asyncio.CancelledError:
+            logger.info("Position stream closed by client")
+        except Exception as e:
+            logger.error(f"Position stream error: {e}")
+            
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*"  # CORS for React
+        }
+    )
+
+
+# ============================================
+# ENHANCED POSITIONS ENDPOINT
+# ============================================
+
+@app.get("/positions")
+def get_positions_enhanced():
+    """
+    Enhanced positions endpoint with real-time MTM calculation.
+    Keeps backward compatibility with existing code.
+    """
+    try:
+        positions_data = kite.positions()
+        net = positions_data['net']
+        nifty_positions = [p for p in net if 'NIFTY' in p['tradingsymbol']]
+        
+        # Add real-time MTM calculation
+        total_mtm = 0
+        for pos in nifty_positions:
+            mtm = (pos['last_price'] - pos['average_price']) * pos['quantity']
+            pos['mtm'] = round(mtm, 2)
+            total_mtm += mtm
+        
+        return {
+            "success": True,
+            "data": nifty_positions,
+            "total_mtm": round(total_mtm, 2),
+            "timestamp": get_ist_time().strftime("%H:%M:%S")
+        }
+    except Exception as e:
+        logger.error(f"Positions fetch failed: {e}")
+        return {
+            "success": False,
+            "data": [],
+            "total_mtm": 0,
+            "error": str(e)
+        }
+
+# Add this BEFORE any route definitions (after app = FastAPI())
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://localhost:5173"],  # React dev servers
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ============================================
+# HEALTH CHECK ENDPOINT
+# ============================================
+
+@app.get("/health")
+def health_check():
+    """
+    Simple health check for the React app to verify backend is alive.
+    """
+    try:
+        # Test Kite connection
+        quote = kite.quote(["NSE:NIFTY 50"])
+        spot = quote["NSE:NIFTY 50"]["last_price"]
+        
+        return {
+            "status": "ok",
+            "backend": "python",
+            "spot": spot,
+            "timestamp": get_ist_time().strftime("%H:%M:%S")
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e)
+        }
+
+
+# ============================================
+# SYSTEM CAPABILITIES ENDPOINT
+# ============================================
+
+@app.get("/capabilities")
+def get_capabilities():
+    """
+    Tells React app what features are available.
+    """
+    return {
+        "backend": "python",
+        "version": "1.0",
+        "features": {
+            "analytics": True,
+            "greeks_calculation": True,
+            "regime_detection": True,
+            "historical_analysis": True,
+            "execution": True,
+            "position_tracking": True,
+            "position_management": False,  # Python doesn't have this
+            "risk_management": False,      # Python doesn't have this
+            "auto_trading": False          # Python doesn't have this
+        },
+        "endpoints": {
+            "analyze": "/analyze",
+            "execute": "/execute_strangle",
+            "positions": "/positions",
+            "positions_stream": "/positions/stream",
+            "historical": "/historical_analysis"
+        }
+    }
+
+# ============================================
+# USAGE INSTRUCTIONS
+# ============================================
+
+"""
+DEPLOYMENT STEPS:
+
+1. Add CORS middleware at the top (after app = FastAPI()):
+   
+   from fastapi.middleware.cors import CORSMiddleware
+   app.add_middleware(CORSMiddleware, ...)
+
+2. Add all the new endpoints above to your file
+
+3. Restart your Python backend:
+   
+   python backend/nifty_kite_backend.py
+
+4. Test the new SSE endpoint:
+   
+   curl http://localhost:8000/positions/stream
+   
+   You should see real-time position updates streaming!
+
+5. Test health check:
+   
+   curl http://localhost:8000/health
+
+6. Deploy React components and start using!
+
+NOTES:
+- SSE will automatically reconnect if connection drops
+- MTM calculation is now accurate for both buy/sell positions
+- All endpoints are CORS-enabled for React
+- No breaking changes to existing code
+"""
+
+# --- INSTRUMENT FETCHING AND CACHING ---
 def get_ist_time():
     utc_now = datetime.now(pytz.utc)
     ist_tz = pytz.timezone('Asia/Kolkata')
@@ -353,7 +557,8 @@ def execute_strangle(payload: dict = Body(...)):
     try:
         call_strike = payload.get("call_strike")
         put_strike = payload.get("put_strike")
-        qty = payload.get("qty", 25)
+        # CHANGED: Default quantity set to 75 as requested (Safer side)
+        qty = payload.get("qty", 75) 
         call_symbol = get_symbol_for_strike(call_strike, 'CE')
         put_symbol = get_symbol_for_strike(put_strike, 'PE')
         if not call_symbol or not put_symbol: raise HTTPException(status_code=400, detail="Invalid Strikes. Refresh Instruments.")

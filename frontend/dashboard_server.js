@@ -5,6 +5,228 @@ const PORT = 3000;
 
 app.use(express.json());
 
+// ============================================
+// BACKEND CONFIGURATION (Hybrid Architecture)
+// ============================================
+
+const BACKENDS = {
+    python: {
+        url: 'http://127.0.0.1:8000',
+        enabled: true,
+        features: ['analytics', 'greeks', 'regime_detection', 'historical_analysis']
+    },
+    go: {
+        url: 'http://127.0.0.1:8080',
+        enabled: true, // Set to TRUE when Go API is running
+        features: ['execution', 'position_management', 'risk_management', 'auto_trading']
+    }
+};
+
+// Smart routing function
+function getBackendUrl(feature) {
+    // Analytics always goes to Python (best intelligence)
+    if (['analytics', 'greeks', 'historical'].includes(feature)) {
+        return BACKENDS.python.url;
+    }
+
+    // Execution: Use Go if available, fallback to Python
+    if (feature === 'execution') {
+        return BACKENDS.go.enabled ? BACKENDS.go.url : BACKENDS.python.url;
+    }
+
+
+    return BACKENDS.python.url;
+}
+
+// ============================================
+// PROXY ENDPOINTS (Smart Routing)
+// ============================================
+
+// Analytics - Always Python
+app.get('/api/data', async (req, res) => {
+    try {
+        const response = await axios.get(`${BACKENDS.python.url}/analyze`);
+        res.json(response.data);
+    } catch (error) {
+        console.error('❌ Analytics failed:', error.message);
+        res.status(502).json({ error: "Python Backend Offline" });
+    }
+});
+
+// Historical Analysis - Always Python
+app.get('/api/history', async (req, res) => {
+    try {
+        const response = await axios.get(`${BACKENDS.python.url}/historical_analysis`);
+        res.json(response.data);
+    } catch (error) {
+        console.error('❌ History failed:', error.message);
+        res.status(502).json({ error: "Backend Offline" });
+    }
+});
+
+// Save Daily Data - Always Python
+app.post('/api/update_daily', async (req, res) => {
+    try {
+        const response = await axios.post(`${BACKENDS.python.url}/update_daily_ohlc`);
+        res.json(response.data);
+    } catch (error) {
+        console.error('❌ EOD save failed:', error.message);
+        res.status(502).json({ error: "Backend Offline" });
+    }
+});
+
+// Positions - Always use Python (it fetches real Zerodha positions)
+app.get('/positions', async (req, res) => {
+    try {
+        console.log('📍 Fetching positions from Python...');
+        const response = await axios.get(`${BACKENDS.python.url}/positions`);
+        res.json({
+            ...response.data,
+            source: 'python'
+        });
+    } catch (error) {
+        console.error('❌ Positions failed:', error.message);
+        res.status(502).json({ error: "Backend Offline", data: [] });
+    }
+});
+
+// Execute Strangle - Smart Routing
+app.post('/execute_strangle', async (req, res) => {
+    try {
+        const { call_strike, put_strike, qty, profile = 'moderate', autoTrade = false } = req.body;
+
+        if (BACKENDS.go.enabled) {
+            // Use Go API for robust execution
+            console.log('🚀 Executing via Go API...');
+
+            // Build symbol names for Go API
+            const symbols = buildSymbols(call_strike, put_strike);
+
+            const response = await axios.post(`${BACKENDS.go.url}/api/strangle/execute`, {
+                callSymbol: symbols.callSymbol,
+                putSymbol: symbols.putSymbol,
+                quantity: qty,
+                autoTrade, // Enable Go's automated management
+                orderType: 'MARKET',
+                product: 'NRML'
+            });
+
+            return res.json(response.data);
+        } else {
+            // Use Python API
+            console.log('🚀 Executing via Python API...');
+            const response = await axios.post(`${BACKENDS.python.url}/execute_strangle`, req.body);
+            res.json(response.data);
+        }
+
+    } catch (error) {
+        console.error('❌ Execution failed:', error.message);
+        res.status(502).json({
+            status: 'error',
+            message: error.response?.data?.message || error.message
+        });
+    }
+});
+
+// Close Position (Go API Only)
+app.post('/close_position', async (req, res) => {
+    if (!BACKENDS.go.enabled) {
+        return res.json({
+            success: false,
+            message: 'Position management requires Go API. Enable it in BACKENDS config.'
+        });
+    }
+
+    try {
+        const { tradingSymbol, quantity } = req.body;
+        const response = await axios.post(`${BACKENDS.go.url}/api/position/close`, {
+            tradingSymbol,
+            quantity,
+            orderType: 'MARKET'
+        });
+        res.json(response.data);
+    } catch (error) {
+        console.error('❌ Close position failed:', error.message);
+        res.status(502).json({ success: false, message: error.message });
+    }
+});
+
+// Close All Positions (Go API Only)
+app.post('/close_all_positions', async (req, res) => {
+    if (!BACKENDS.go.enabled) {
+        return res.json({
+            success: false,
+            message: 'Bulk operations require Go API'
+        });
+    }
+
+    try {
+        const response = await axios.post(`${BACKENDS.go.url}/api/positions/close-all`);
+        res.json(response.data);
+    } catch (error) {
+        console.error('❌ Close all failed:', error.message);
+        res.status(502).json({ success: false, message: error.message });
+    }
+});
+
+// System Status - Check both backends
+app.get('/api/system_status', async (req, res) => {
+    const status = {
+        python: { available: false, url: BACKENDS.python.url },
+        go: { available: false, url: BACKENDS.go.url },
+        activeBackend: BACKENDS.go.enabled ? 'go' : 'python',
+        features: {
+            analytics: true,
+            execution: true,
+            positionManagement: BACKENDS.go.enabled,
+            riskManagement: BACKENDS.go.enabled,
+            autoTrading: BACKENDS.go.enabled
+        }
+    };
+
+    // Test Python
+    try {
+        await axios.get(`${BACKENDS.python.url}/analyze`, { timeout: 2000 });
+        status.python.available = true;
+    } catch (error) {
+        console.warn('⚠️ Python backend unavailable');
+    }
+
+    // Test Go
+    if (BACKENDS.go.enabled) {
+        try {
+            await axios.get(`${BACKENDS.go.url}/health`, { timeout: 2000 });
+            status.go.available = true;
+        } catch (error) {
+            console.warn('⚠️ Go backend unavailable');
+        }
+    }
+
+    res.json(status);
+});
+
+// ============================================
+// HELPER FUNCTIONS
+// ============================================
+
+function buildSymbols(callStrike, putStrike) {
+    const today = new Date();
+    const dayOfWeek = today.getDay();
+    const daysUntilExpiry = dayOfWeek === 4 ? 0 : (4 - dayOfWeek + 7) % 7;
+    const expiry = new Date(today);
+    expiry.setDate(today.getDate() + daysUntilExpiry);
+
+    const year = expiry.getFullYear().toString().slice(-2);
+    const month = expiry.toLocaleString('en-US', { month: 'short' }).toUpperCase();
+    const day = expiry.getDate();
+
+    return {
+        callSymbol: `NIFTY${year}${month}${day}${callStrike}CE`,
+        putSymbol: `NIFTY${year}${month}${day}${putStrike}PE`
+    };
+}
+// ============================================
+
 const getHtml = () => `
 <!DOCTYPE html>
 <html lang="en">
@@ -31,6 +253,27 @@ const getHtml = () => `
         .flow-bar { height: 4px; width: 100%; background: #334155; border-radius: 2px; overflow: hidden; display: flex; margin-top: 4px; }
         .flow-buy { background: #4ade80; height: 100%; }
         .flow-sell { background: #f87171; height: 100%; }
+
+        /* Scrollable Positions Table */
+        .positions-scroll-container {
+            max-height: 400px;
+            overflow-y: auto;
+            overflow-x: hidden;
+        }
+        .positions-scroll-container::-webkit-scrollbar {
+            width: 8px;
+        }
+        .positions-scroll-container::-webkit-scrollbar-track {
+            background: #1e293b;
+            border-radius: 4px;
+        }
+        .positions-scroll-container::-webkit-scrollbar-thumb {
+            background: #475569;
+            border-radius: 4px;
+        }
+        .positions-scroll-container::-webkit-scrollbar-thumb:hover {
+            background: #64748b;
+        }
         
         /* New Intel Animations */
         @keyframes pulse-soft { 0% { opacity: 0.8; } 50% { opacity: 1; } 100% { opacity: 0.8; } }
@@ -58,7 +301,40 @@ const getHtml = () => `
             </div>
         </div>
     </div>
-
+    <!-- SYSTEM STATUS PANEL (NEW - REQUIRED FOR POSITIONS) -->
+    <div class="glass-panel p-3 rounded-xl border-l-4 border-cyan-500 mb-4 bg-slate-800/50">
+        <div class="flex justify-between items-center flex-wrap gap-4">
+            <div class="flex items-center gap-4">
+                <div>
+                    <div class="stat-label text-cyan-300">Backend Status</div>
+                    <div class="flex items-center gap-3 mt-1">
+                        <div class="flex items-center">
+                            <span class="live-dot bg-gray-500" id="python-status"></span>
+                            <span class="text-xs text-slate-300">Python</span>
+                        </div>
+                        <div class="flex items-center">
+                            <span class="live-dot bg-gray-500" id="go-status"></span>
+                            <span class="text-xs text-slate-300">Go</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="h-8 w-px bg-slate-700"></div>
+                <div>
+                    <div class="stat-label text-cyan-300">Active Backend</div>
+                    <div class="text-white font-bold" id="active-backend">--</div>
+                </div>
+                <div class="h-8 w-px bg-slate-700"></div>
+                <div>
+                    <div class="stat-label text-cyan-300">Position Source</div>
+                    <div class="text-white font-mono text-sm" id="position-source">--</div>
+                </div>
+            </div>
+            <div class="flex gap-2">
+                <span class="backend-badge bg-slate-700 text-slate-400" id="feature-execution">Execution ✗</span>
+                <span class="backend-badge bg-slate-700 text-slate-400" id="feature-management">Position Mgmt ✗</span>
+            </div>
+        </div>
+    </div>
     <!-- MARKET INTEL PANEL (NEW) -->
     <div class="glass-panel p-3 rounded-xl border-l-4 border-indigo-500 mb-6 bg-slate-800/50">
         <div class="flex justify-between items-center flex-wrap gap-4">
@@ -187,40 +463,61 @@ const getHtml = () => `
          <div class="relative h-48 w-full"><canvas id="strangleChart"></canvas></div>
     </div>
 
-    <!-- LIVE POSITIONS TABLE (TOGGLEABLE) -->
-    <div class="mb-8">
-        <div class="flex justify-between items-center mb-2 px-1">
-            <h3 class="text-slate-400 text-xs font-bold uppercase tracking-widest">Live Positions (MTM)</h3>
-            <div class="flex items-center">
-                <span class="mr-2 text-xs text-slate-400">Show</span>
-                <div class="relative inline-block w-10 h-6 align-middle select-none transition duration-200 ease-in">
-                    <input type="checkbox" name="togglePositions" id="positions-toggle" class="toggle-checkbox absolute block w-6 h-6 rounded-full bg-white border-4 appearance-none cursor-pointer" onclick="togglePositions()" checked />
-                    <label for="positions-toggle" class="toggle-label block overflow-hidden h-6 rounded-full bg-gray-600 cursor-pointer"></label>
+   <!-- LIVE POSITIONS TABLE (SCROLLABLE) -->
+    <div class="glass-panel rounded-xl overflow-hidden mb-6">
+        <div class="flex justify-between items-center p-4 border-b border-slate-700">
+            <h3 class="text-lg font-bold text-white flex items-center gap-2">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 text-cyan-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+                </svg>
+                Live Positions
+            </h3>
+            
+            <div class="flex items-center gap-4">
+                <!-- Close All Button -->
+                <button onclick="closeAllPositions()" id="close-all-btn" class="px-4 py-2 bg-red-600 hover:bg-red-700 text-white text-sm font-bold rounded-lg transition shadow-lg hidden">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 inline mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                    Close All
+                </button>
+                
+                <!-- Toggle Switch -->
+                <div class="flex items-center gap-2">
+                    <span class="text-xs text-slate-400">Show</span>
+                    <div class="relative inline-block w-10 h-6 align-middle select-none transition duration-200 ease-in">
+                        <input type="checkbox" name="togglePositions" id="positions-toggle" class="toggle-checkbox absolute block w-6 h-6 rounded-full bg-white border-4 appearance-none cursor-pointer" onclick="togglePositions()" checked />
+                        <label for="positions-toggle" class="toggle-label block overflow-hidden h-6 rounded-full bg-gray-600 cursor-pointer"></label>
+                    </div>
                 </div>
             </div>
         </div>
         
-        <div id="positions-container" class="glass-panel rounded-xl overflow-hidden transition-all duration-300">
-            <table class="w-full text-sm text-left text-slate-400">
-                <thead class="text-xs text-slate-300 uppercase bg-slate-700">
+        <!-- Scrollable Container -->
+        <div id="positions-container" class="positions-scroll-container">
+            <table class="w-full text-sm">
+                <thead class="text-xs text-slate-300 uppercase bg-slate-700 sticky top-0 z-10">
                     <tr>
-                        <th class="px-4 py-3">Symbol</th>
+                        <th class="px-4 py-3 text-left">Symbol</th>
                         <th class="px-4 py-3 text-right">Qty</th>
                         <th class="px-4 py-3 text-right">Avg Price</th>
                         <th class="px-4 py-3 text-right">LTP</th>
                         <th class="px-4 py-3 text-right">P&L</th>
+                        <th class="px-4 py-3 text-right">Action</th>
                     </tr>
                 </thead>
                 <tbody id="positions-body">
-                    <tr><td colspan="5" class="px-4 py-3 text-center text-slate-500">No open positions</td></tr>
+                    <tr><td colspan="6" class="px-4 py-3 text-center text-slate-500">Loading positions...</td></tr>
                 </tbody>
-                <tfoot class="bg-slate-800/50 font-bold text-slate-200">
-                    <tr>
-                        <td colspan="4" class="px-4 py-2 text-right">Total MTM:</td>
-                        <td class="px-4 py-2 text-right" id="total-mtm">--</td>
-                    </tr>
-                </tfoot>
             </table>
+        </div>
+        
+        <!-- Footer with Total MTM (Always Visible) -->
+        <div class="bg-slate-800/50 border-t border-slate-700 p-3">
+            <div class="flex justify-between items-center">
+                <span class="text-sm text-slate-400 font-semibold">Total MTM:</span>
+                <span class="text-lg font-bold" id="total-mtm">--</span>
+            </div>
         </div>
     </div>
 
@@ -437,45 +734,194 @@ const getHtml = () => `
             }
         }
 
+         // Check system status on load
+        let systemStatus = null;
+        let positionSource = 'unknown';
+
+        // Check system status on load
+        async function checkSystemStatus() {
+            try {
+                const res = await fetch('/api/system_status');
+                systemStatus = await res.json();
+                
+                console.log('📊 System Status:', systemStatus);
+                
+                // Update status indicators
+                document.getElementById('python-status').className = 
+                    'live-dot ' + (systemStatus.python.available ? 'bg-green-500' : 'bg-red-500');
+                document.getElementById('go-status').className = 
+                    'live-dot ' + (systemStatus.go.available ? 'bg-green-500' : 'bg-red-500');
+                
+                // Update active backend
+                document.getElementById('active-backend').innerText = 
+                    systemStatus.activeBackend.toUpperCase() + ' API';
+                
+                // Update feature badges
+                document.getElementById('feature-execution').className = 
+                    'backend-badge ' + (systemStatus.go.available ? 'bg-green-900 text-green-300' : 'bg-slate-700 text-slate-400');
+                document.getElementById('feature-execution').innerText = 
+                    'Execution ' + (systemStatus.go.available ? '✓' : '✗');
+                
+                if (systemStatus.features.positionManagement && systemStatus.go.available) {
+                    document.getElementById('feature-management').className = 
+                        'backend-badge bg-green-900 text-green-300';
+                    document.getElementById('feature-management').innerText = 'Position Mgmt ✓';
+                    
+                    // Show close buttons if Go API is available
+                    document.getElementById('close-all-btn').classList.remove('hidden');
+                }
+                
+            } catch (error) {
+                console.error('❌ System status check failed:', error);
+            }
+        }
+
         async function updatePositions() {
             try {
+                console.log('🔄 Fetching positions...');
                 const res = await fetch('/positions');
                 const json = await res.json();
-                const positions = json.data;
+                
+                console.log('📦 Positions response:', json);
+                
+                const positions = json.data || [];
+                positionSource = json.source || 'unknown';
+                
+                // Update source indicator
+                document.getElementById('position-source').innerText = positionSource.toUpperCase();
+                
                 const tbody = document.getElementById('positions-body');
                 tbody.innerHTML = '';
                 let totalMtm = 0;
 
                 if (positions.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="5" class="px-4 py-3 text-center text-slate-500">No open positions</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="6" class="px-4 py-3 text-center text-slate-500">No positions</td></tr>';
                 } else {
-                    positions.forEach(pos => {
-                        // MANUAL P&L CALCULATION (Real-time Accuracy)
-                        // Formula: (Last Price - Average Price) * Quantity
-                        // Works for both Buy (Qty > 0) and Sell (Qty < 0)
-                        // E.g., Sell: (38 - 25.5) * -75 = 12.5 * -75 = -937.5 (Loss) -> Correct
-                        const mtm = (pos.last_price - pos.average_price) * pos.quantity;
-                        
+                    // Separate open and closed positions
+                    const openPos = positions.filter(p => p.status === 'OPEN');
+                    const closedPos = positions.filter(p => p.status === 'CLOSED');
+                    
+                    // Check if position management is available
+                    const canClose = systemStatus && systemStatus.features && systemStatus.features.positionManagement;
+                    
+                    // Render OPEN positions first
+                    openPos.forEach(pos => {
+                        const mtm = pos.mtm || ((pos.last_price - pos.average_price) * pos.quantity);
                         totalMtm += mtm;
-                        const row = \`
+                        
+                        // Always show close button, but disable if not supported
+                        const closeBtn = \`
+                            <button 
+                                onclick="closePosition('\${pos.tradingsymbol}', \${Math.abs(pos.quantity)})" 
+                                class="px-3 py-1 \${canClose ? 'bg-red-600 hover:bg-red-700' : 'bg-gray-600 cursor-not-allowed'} text-white text-xs rounded transition font-semibold"
+                                \${canClose ? '' : 'disabled'}
+                            >
+                                Close
+                            </button>
+                        \`;
+                        
+                        tbody.innerHTML += \`
                             <tr class="border-b border-slate-800 hover:bg-slate-800/30 transition">
                                 <td class="px-4 py-3 text-white font-medium">\${pos.tradingsymbol}</td>
                                 <td class="px-4 py-3 text-right text-slate-300">\${pos.quantity}</td>
                                 <td class="px-4 py-3 text-right text-slate-300">\${pos.average_price.toFixed(2)}</td>
                                 <td class="px-4 py-3 text-right text-white">\${pos.last_price.toFixed(2)}</td>
                                 <td class="px-4 py-3 text-right font-bold \${mtm >= 0 ? 'text-green-400' : 'text-red-400'}">\${mtm.toFixed(2)}</td>
+                                <td class="px-4 py-3 text-right">\${closeBtn}</td>
                             </tr>
                         \`;
-                        tbody.innerHTML += row;
                     });
-                }
-                
-                const totalEl = document.getElementById('total-mtm');
-                totalEl.innerText = totalMtm.toFixed(2);
-                totalEl.className = \`px-4 py-2 text-right font-bold \${totalMtm >= 0 ? 'text-green-400' : 'text-red-400'}\`;
+                    
+                    // Add separator if there are closed positions
+                    if (closedPos.length > 0 && openPos.length > 0) {
+                        tbody.innerHTML += \`
+                            <tr class="bg-slate-800/50">
+                                <td colspan="6" class="px-4 py-2 text-center text-slate-400 text-xs font-bold uppercase tracking-wider">
+                                    ─── Closed Positions (Today) ───
+                                </td>
+                            </tr>
+                        \`;
+                    }
+                    
+                    // Render CLOSED positions
+                    closedPos.forEach(pos => {
+                        totalMtm += pos.mtm;
+                        tbody.innerHTML += \`
+                            <tr class="border-b border-slate-800 bg-slate-900/30 opacity-70">
+                                <td class="px-4 py-3 text-slate-400 font-medium">\${pos.tradingsymbol}</td>
+                                <td class="px-4 py-3 text-right text-slate-500">\${pos.quantity}</td>
+                                <td class="px-4 py-3 text-right text-slate-500">\${pos.average_price.toFixed(2)}</td>
+                                <td class="px-4 py-3 text-right text-slate-400">\${pos.exit_price.toFixed(2)}</td>
+                                <td class="px-4 py-3 text-right font-bold \${pos.mtm >= 0 ? 'text-green-400' : 'text-red-400'}">\${pos.mtm.toFixed(2)}</td>
+                                <td class="px-4 py-3 text-right text-xs text-slate-500">Closed \${pos.closed_at || ''}</td>
+                            </tr>
+                        \`;
+                    });
+            }
+            
+            const totalEl = document.getElementById('total-mtm');
+            totalEl.innerText = totalMtm.toFixed(2);
+            totalEl.className = \`text-lg font-bold \${totalMtm >= 0 ? 'text-green-400' : 'text-red-400'}\`;
 
-            } catch(e) { console.error("Pos fetch error", e); }
+            // Show breakdown if available
+            if (json.breakdown) {
+                console.log(\`📊 MTM Breakdown: Open: \${json.breakdown.open_mtm} | Closed: \${json.breakdown.closed_mtm} | Total: \${totalMtm.toFixed(2)}\`);
+            }
+            
+        } catch (error) {
+            console.error('❌ Positions fetch failed:', error);
+            document.getElementById('positions-body').innerHTML = 
+                '<tr><td colspan="6" class="px-4 py-3 text-center text-red-400">Failed to load positions</td></tr>';
         }
+    }
+
+        async function closePosition(symbol, qty) {
+            if (!confirm(\`Close position \${symbol}?\`)) return;
+            
+            try {
+                const res = await fetch('/close_position', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ tradingSymbol: symbol, quantity: qty })
+                });
+                const result = await res.json();
+                
+                if (result.success) {
+                    alert('✅ Position closed');
+                    updatePositions();
+                } else {
+                    alert('❌ ' + result.message);
+                }
+            } catch (error) {
+                alert('❌ Failed to close position: ' + error.message);
+            }
+        }
+
+        async function closeAllPositions() {
+            if (!confirm('Close ALL positions?')) return;
+            
+            try {
+                const res = await fetch('/close_all_positions', { method: 'POST' });
+                const result = await res.json();
+                
+                if (result.success) {
+                    alert('✅ ' + result.message);
+                    updatePositions();
+                } else {
+                    alert('❌ ' + result.message);
+                }
+            } catch (error) {
+                alert('❌ Failed to close positions: ' + error.message);
+            }
+        }
+
+
+         // Initialize
+        console.log('🚀 Dashboard initializing...');
+        checkSystemStatus();
+        updatePositions();
+        setInterval(checkSystemStatus, 30000); // Check status every 30s
+        setInterval(updatePositions, 2000); // Update positions every 2s
 
         async function updateDashboard(manualRefresh = false) {
             try {
@@ -609,16 +1055,27 @@ const getHtml = () => `
         toggleStrangleChart();
         togglePositions(); // Initialize toggle state
         setInterval(() => updateDashboard(false), 2000);
+        setInterval(checkSystemStatus, 30000); // Check status every 30s
     </script>
 </body>
 </html>
 `;
 
-app.post('/execute_strangle', async (req, res) => { try { const response = await axios.post('http://127.0.0.1:8000/execute_strangle', req.body); res.json(response.data); } catch (error) { res.status(502).json({ error: "Backend Offline" }); } });
-app.get('/positions', async (req, res) => { try { const response = await axios.get('http://127.0.0.1:8000/positions'); res.json(response.data); } catch (error) { res.status(502).json({ error: "Backend Offline" }); } });
-app.post('/api/update_daily', async (req, res) => { try { const response = await axios.post('http://127.0.0.1:8000/update_daily_ohlc'); res.json(response.data); } catch (error) { res.status(502).json({ error: "Backend Offline" }); } });
-app.get('/api/history', async (req, res) => { try { const response = await axios.get('http://127.0.0.1:8000/historical_analysis'); res.json(response.data); } catch (error) { res.status(502).json({ error: "Backend Offline" }); } });
-app.get('/api/data', async (req, res) => { try { const response = await axios.get('http://127.0.0.1:8000/analyze'); res.json(response.data); } catch (error) { res.status(502).json({ error: "Backend Offline" }); } });
+
 app.get('/', (req, res) => res.send(getHtml()));
 
-app.listen(PORT, () => console.log("Dashboard running on http://localhost:" + PORT));
+app.listen(PORT, () => {
+    console.log(`
+╔════════════════════════════════════════════════════════════╗
+║     NIFTY OPTIONS DASHBOARD - HYBRID BACKEND READY        ║
+╠════════════════════════════════════════════════════════════╣
+║  Dashboard:      http://localhost:${PORT}                     ║
+║  Python API:     ${BACKENDS.python.url}                  ║
+║  Go API:         ${BACKENDS.go.url} (${BACKENDS.go.enabled ? 'ENABLED' : 'DISABLED'})     ║
+╠════════════════════════════════════════════════════════════╣
+║  Analytics:      Python (Best Intelligence)               ║
+║  Execution:      ${BACKENDS.go.enabled ? 'Go API (Managed)' : 'Python (Manual)'}                  ║
+║  Positions:      ${BACKENDS.go.enabled ? 'Go API (Advanced)' : 'Python (Basic)'}                ║
+╚════════════════════════════════════════════════════════════╝
+    `);
+});

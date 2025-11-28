@@ -1,5 +1,5 @@
 import uvicorn
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body, Request
 from kiteconnect import KiteConnect
 import pandas as pd
 import numpy as np
@@ -10,10 +10,13 @@ import pytz
 import sqlite3
 import math
 from dotenv import load_dotenv
+import json 
 
 from fastapi.responses import StreamingResponse
 import asyncio
 from fastapi.middleware.cors import CORSMiddleware
+
+
 
 # --- CONFIGURATION ---
 load_dotenv()
@@ -22,11 +25,21 @@ API_KEY = os.getenv("KITE_API_KEY")
 ACCESS_TOKEN = os.getenv("KITE_ACCESS_TOKEN")
 DB_FILE = "backend/nifty_history.db" 
 
+# --- FASTAPI INIT ---
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("NiftyEngine")
 
 instrument_cache = { "nifty_tokens": [], "expiry": None, "strike_map": {} }
+
+# Add this BEFORE any route definitions (after app = FastAPI())
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://localhost:5173"],  # React dev servers
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 try:
     kite = KiteConnect(api_key=API_KEY)
@@ -119,50 +132,115 @@ async def stream_positions():
 
 
 # ============================================
-# ENHANCED POSITIONS ENDPOINT
+# FIXED POSITIONS ENDPOINT
+# Replace your existing @app.get("/positions") endpoint
+# Daily closed positions tracker (in-memory for the session)
 # ============================================
 
 @app.get("/positions")
-def get_positions_enhanced():
+async def get_positions(request: Request):
     """
-    Enhanced positions endpoint with real-time MTM calculation.
-    Keeps backward compatibility with existing code.
+    Returns both OPEN and CLOSED positions for the day.
+    Open positions: Live from Zerodha
+    Closed positions: From Zerodha's net positions (qty=0 but traded today)
     """
     try:
-        positions_data = kite.positions()
-        net = positions_data['net']
-        nifty_positions = [p for p in net if 'NIFTY' in p['tradingsymbol']]
+        logger.info("Fetching positions from Kite...")
         
-        # Add real-time MTM calculation
-        total_mtm = 0
-        for pos in nifty_positions:
-            mtm = (pos['last_price'] - pos['average_price']) * pos['quantity']
-            pos['mtm'] = round(mtm, 2)
-            total_mtm += mtm
+        positions_data = kite.positions()
+        net = positions_data.get('net', [])
+        
+        open_positions = []
+        closed_positions = []
+        seen_closed = set()
+        
+        for p in net:
+            if 'NIFTY' not in p.get('tradingsymbol', ''):
+                continue
+            
+            symbol = p['tradingsymbol']
+            
+            # OPEN positions (qty != 0)
+            if p.get('quantity', 0) != 0:
+                mtm = (p['last_price'] - p['average_price']) * p['quantity']
+                open_positions.append({
+                    "tradingsymbol": p['tradingsymbol'],
+                    "quantity": p['quantity'],
+                    "average_price": p['average_price'],
+                    "last_price": p['last_price'],
+                    "mtm": round(mtm, 2),
+                    "product": p['product'],
+                    "exchange": p['exchange'],
+                    "status": "OPEN"
+                })
+            
+            # CLOSED positions (qty=0 but traded today)
+            elif p.get('quantity', 0) == 0 and symbol not in seen_closed:
+                # Check if this was actually traded today
+                buy_qty = p.get('buy_quantity', 0)
+                sell_qty = p.get('sell_quantity', 0)
+                
+                if buy_qty > 0 or sell_qty > 0:
+                    seen_closed.add(symbol)  # Prevent duplicates
+                    # Calculate realized P&L
+                    buy_value = p.get('buy_value', 0)
+                    sell_value = p.get('sell_value', 0)
+                    realized_pnl = sell_value - buy_value
+                    
+                    # Get the traded quantity (whichever is non-zero)
+                    traded_qty = buy_qty if buy_qty > 0 else sell_qty
+                    
+                    closed_positions.append({
+                        "tradingsymbol": p['tradingsymbol'],
+                        "quantity": traded_qty,
+                        "average_price": p.get('average_price', 0),
+                        "exit_price": p.get('last_price', 0),
+                        "mtm": round(realized_pnl, 2),
+                        "product": p['product'],
+                        "exchange": p['exchange'],
+                        "status": "CLOSED",
+                        "closed_at": get_ist_time().strftime("%H:%M:%S")
+                    })
+        
+        # Combine open + closed positions
+        all_positions = open_positions + closed_positions
+        
+        # Calculate total MTM
+        total_open_mtm = sum(p['mtm'] for p in open_positions)
+        total_closed_mtm = sum(p['mtm'] for p in closed_positions)
+        total_mtm = total_open_mtm + total_closed_mtm
+        
+        logger.info(f"✅ Returning {len(open_positions)} open, {len(closed_positions)} closed positions")
         
         return {
             "success": True,
-            "data": nifty_positions,
+            "data": all_positions,
             "total_mtm": round(total_mtm, 2),
+            "breakdown": {
+                "open_mtm": round(total_open_mtm, 2),
+                "closed_mtm": round(total_closed_mtm, 2),
+                "open_count": len(open_positions),
+                "closed_count": len(closed_positions)
+            },
+            "source": "python",
             "timestamp": get_ist_time().strftime("%H:%M:%S")
         }
+        
     except Exception as e:
-        logger.error(f"Positions fetch failed: {e}")
+        logger.error(f"❌ Positions fetch failed: {e}")
+        import traceback
+        traceback.print_exc()
+        
         return {
             "success": False,
             "data": [],
             "total_mtm": 0,
-            "error": str(e)
+            "error": str(e),
+            "source": "python",
+            "timestamp": get_ist_time().strftime("%H:%M:%S")
         }
 
-# Add this BEFORE any route definitions (after app = FastAPI())
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173"],  # React dev servers
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
 
 # ============================================
 # HEALTH CHECK ENDPOINT
@@ -190,7 +268,66 @@ def health_check():
             "error": str(e)
         }
 
-
+@app.post("/close_position")
+def close_position(payload: dict = Body(...)):
+    """
+    Close a specific position by placing a counter order.
+    Tracks the closed position for daily reporting.
+    """
+    try:
+        trading_symbol = payload.get("tradingSymbol")
+        quantity = payload.get("quantity")
+        
+        if not trading_symbol or not quantity:
+            return {"success": False, "message": "Missing symbol or quantity"}
+        
+        # Get current position details before closing
+        positions_data = kite.positions()
+        current_pos = None
+        for p in positions_data['net']:
+            if p['tradingsymbol'] == trading_symbol:
+                current_pos = p
+                break
+        
+        if not current_pos:
+            return {"success": False, "message": "Position not found"}
+        
+        # Place BUY order to close SELL position (or vice versa)
+        transaction_type = kiteconnect.TRANSACTION_TYPE_BUY if current_pos['quantity'] < 0 else kiteconnect.TRANSACTION_TYPE_SELL
+        
+        order_id = kite.place_order(
+            tradingsymbol=trading_symbol,
+            exchange=kite.EXCHANGE_NFO,
+            transaction_type=transaction_type,
+            quantity=abs(quantity),
+            order_type=kite.ORDER_TYPE_MARKET,
+            product=kite.PRODUCT_MIS,
+            variety=kite.VARIETY_REGULAR
+        )
+        
+        # Get exit price (approximate as current LTP)
+        quote = kite.quote([f"NFO:{trading_symbol}"])
+        exit_price = quote[f"NFO:{trading_symbol}"]["last_price"]
+        
+        # Calculate realized P&L
+        mtm = (current_pos['average_price'] - exit_price) * current_pos['quantity']
+        
+        logger.info(f"✅ Closed {trading_symbol}: P&L = {mtm:.2f}")
+        
+        return {
+            "success": True,
+            "message": f"Position closed: {trading_symbol}",
+            "order_id": order_id,
+            "realized_pnl": round(mtm, 2)
+        }
+        
+    except Exception as e:
+        logger.error(f"Close position failed: {e}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
+    
 # ============================================
 # SYSTEM CAPABILITIES ENDPOINT
 # ============================================
@@ -568,17 +705,6 @@ def execute_strangle(payload: dict = Body(...)):
     except Exception as e:
         logger.error(f"Execution Failed: {e}")
         return {"status": "error", "message": str(e)} 
-
-@app.get("/positions")
-def get_positions():
-    try:
-        positions = kite.positions()
-        net = positions['net']
-        nifty_positions = [p for p in net if 'NIFTY' in p['tradingsymbol']]
-        return {"data": nifty_positions}
-    except Exception as e:
-        logger.error(f"Positions fetch failed: {e}")
-        return {"data": []}
 
 @app.get("/analyze")
 def get_analysis():

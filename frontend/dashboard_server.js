@@ -5,6 +5,53 @@ const PORT = 3000;
 
 app.use(express.json());
 
+// Add position caching
+let lastKnownPositions = [];
+let lastPositionUpdate = null;
+
+class CircuitBreaker {
+    constructor(name, failureThreshold = 5, resetTimeout = 60000) {
+        this.name = name;
+        this.failureCount = 0;
+        this.failureThreshold = failureThreshold;
+        this.resetTimeout = resetTimeout;
+        this.state = 'CLOSED'; // CLOSED, OPEN, HALF_OPEN
+        this.nextAttempt = Date.now();
+    }
+
+    async execute(fn) {
+        if (this.state === 'OPEN') {
+            if (Date.now() < this.nextAttempt) {
+                throw new Error(`Circuit breaker [${this.name}] is OPEN`);
+            }
+            this.state = 'HALF_OPEN';
+        }
+
+        try {
+            const result = await fn();
+            this.onSuccess();
+            return result;
+        } catch (error) {
+            this.onFailure();
+            throw error;
+        }
+    }
+
+    onSuccess() {
+        this.failureCount = 0;
+        this.state = 'CLOSED';
+    }
+
+    onFailure() {
+        this.failureCount++;
+        if (this.failureCount >= this.failureThreshold) {
+            this.state = 'OPEN';
+            this.nextAttempt = Date.now() + this.resetTimeout;
+            console.error(`⚠️ Circuit breaker [${this.name}] OPENED after ${this.failureCount} failures`);
+        }
+    }
+}
+
 // ============================================
 // BACKEND CONFIGURATION (Hybrid Architecture)
 // ============================================
@@ -22,6 +69,9 @@ const BACKENDS = {
     }
 };
 
+const pythonBreaker = new CircuitBreaker('Python', 3, 30000);
+const goBreaker = new CircuitBreaker('Go', 3, 30000);
+
 // ============================================
 // HEALTH CHECK - Verify Go API is Running
 // ============================================
@@ -36,6 +86,22 @@ async function checkGoAPI() {
     } catch (error) {
         console.error('❌ Go API Unavailable:', error.message);
         return false;
+    }
+}
+
+
+// Retry with exponential backoff
+async function retryWithBackoff(fn, maxRetries = 3) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            return await fn();
+        } catch (error) {
+            if (attempt === maxRetries) throw error;
+            
+            const delay = Math.min(1000 * Math.pow(2, attempt), 10000);
+            console.log(`Retry ${attempt}/${maxRetries} after ${delay}ms...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
     }
 }
 
@@ -99,36 +165,76 @@ app.post('/api/update_daily', async (req, res) => {
 // POSITIONS - Use Go API (Advanced Features)
 // ============================================
 
+// REPLACE /positions endpoint with this:
 app.get('/positions', async (req, res) => {
     try {
-        console.log('📊 Fetching positions from Go API...');
+        console.log('📊 Fetching positions with circuit breaker...');
 
-        // Check if Go API is available
-        const goAvailable = await checkGoAPI();
+        // Try Go API with circuit breaker
+        try {
+            const goResponse = await goBreaker.execute(() =>
+                retryWithBackoff(() =>
+                    axios.get(`${BACKENDS.go.url}/api/positions`, { timeout: 5000 })
+                )
+            );
 
-        if (goAvailable) {
-            const response = await axios.get(`${BACKENDS.go.url}/api/positions`);
-            res.json({
-                ...response.data,
-                source: 'go_api'
+            return res.json({
+                ...goResponse.data,
+                source: 'go_api',
+                reliability: 'primary'
             });
-        } else {
-            // Fallback to Python if Go is unavailable
-            console.log('⚠️ Falling back to Python positions...');
-            const response = await axios.get(`${BACKENDS.python.url}/positions`);
-            res.json({
-                ...response.data,
-                source: 'python_fallback'
-            });
+
+        } catch (goError) {
+            console.warn('⚠️ Go API failed, falling back to Python...');
+
+            // Fallback to Python with circuit breaker
+            try {
+                const pythonResponse = await pythonBreaker.execute(() =>
+                    retryWithBackoff(() =>
+                        axios.get(`${BACKENDS.python.url}/positions`, { timeout: 5000 })
+                    )
+                );
+
+                return res.json({
+                    ...pythonResponse.data,
+                    source: 'python_fallback',
+                    reliability: 'backup',
+                    warning: 'Primary system unavailable'
+                });
+
+            } catch (pythonError) {
+                console.error('❌ Both backends failed!');
+                
+                // Return cached data if available
+                if (lastKnownPositions) {
+                    return res.json({
+                        success: true,
+                        data: lastKnownPositions,
+                        source: 'cache',
+                        reliability: 'degraded',
+                        warning: 'Using cached data - systems unavailable',
+                        cached_at: lastPositionUpdate
+                    });
+                }
+
+                // Ultimate fallback - empty but valid response
+                return res.status(503).json({
+                    success: false,
+                    data: [],
+                    total_mtm: 0,
+                    source: 'none',
+                    error: 'All position sources unavailable',
+                    timestamp: new Date().toISOString()
+                });
+            }
         }
 
     } catch (error) {
-        console.error('❌ Positions failed:', error.message);
-        res.status(502).json({
+        console.error('❌ Critical error in position handler:', error);
+        res.status(500).json({
             success: false,
-            error: "Position fetch failed",
             data: [],
-            source: 'error'
+            error: error.message
         });
     }
 });

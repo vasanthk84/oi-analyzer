@@ -22,6 +22,24 @@ const BACKENDS = {
     }
 };
 
+// ============================================
+// HEALTH CHECK - Verify Go API is Running
+// ============================================
+
+async function checkGoAPI() {
+    try {
+        const response = await axios.get(`${BACKENDS.go.url}/health`, { timeout: 2000 });
+        if (response.data.status === 'ok') {
+            console.log('✅ Go API Connected | Spot:', response.data.spot);
+            return true;
+        }
+    } catch (error) {
+        console.error('❌ Go API Unavailable:', error.message);
+        return false;
+    }
+}
+
+
 // Smart routing function
 function getBackendUrl(feature) {
     // Analytics always goes to Python (best intelligence)
@@ -75,131 +93,194 @@ app.post('/api/update_daily', async (req, res) => {
     }
 });
 
-// Positions - Always use Python (it fetches real Zerodha positions)
+
+
+// ============================================
+// POSITIONS - Use Go API (Advanced Features)
+// ============================================
+
 app.get('/positions', async (req, res) => {
     try {
-        console.log('📍 Fetching positions from Python...');
-        const response = await axios.get(`${BACKENDS.python.url}/positions`);
-        res.json({
-            ...response.data,
-            source: 'python'
-        });
+        console.log('📊 Fetching positions from Go API...');
+
+        // Check if Go API is available
+        const goAvailable = await checkGoAPI();
+
+        if (goAvailable) {
+            const response = await axios.get(`${BACKENDS.go.url}/api/positions`);
+            res.json({
+                ...response.data,
+                source: 'go_api'
+            });
+        } else {
+            // Fallback to Python if Go is unavailable
+            console.log('⚠️ Falling back to Python positions...');
+            const response = await axios.get(`${BACKENDS.python.url}/positions`);
+            res.json({
+                ...response.data,
+                source: 'python_fallback'
+            });
+        }
+
     } catch (error) {
         console.error('❌ Positions failed:', error.message);
-        res.status(502).json({ error: "Backend Offline", data: [] });
+        res.status(502).json({
+            success: false,
+            error: "Position fetch failed",
+            data: [],
+            source: 'error'
+        });
     }
 });
 
-// Execute Strangle - Smart Routing
+// ============================================
+// EXECUTE STRANGLE - Use Go API (Intelligent Execution)
+// ============================================
+
 app.post('/execute_strangle', async (req, res) => {
     try {
-        const { call_strike, put_strike, qty, profile = 'moderate', autoTrade = false } = req.body;
+        const { call_strike, put_strike, qty = 75, profile = 'moderate', autoTrade = true } = req.body;
 
-        if (BACKENDS.go.enabled) {
-            // Use Go API for robust execution
-            console.log('🚀 Executing via Go API...');
+        console.log('🚀 Executing Strangle via Go API...');
+        console.log(`   Call: ${call_strike} | Put: ${put_strike} | Qty: ${qty} | Auto: ${autoTrade}`);
 
-            // Build symbol names for Go API
-            const symbols = buildSymbols(call_strike, put_strike);
+        // ✅ FIXED: Send data in Go API's expected format
+        const response = await axios.post(`${BACKENDS.go.url}/api/strangle/execute`, {
+            call_strike: parseFloat(call_strike),
+            put_strike: parseFloat(put_strike),
+            quantity: parseInt(qty),
+            autoTrade: autoTrade  // Enable Go's risk management
+        });
 
-            const response = await axios.post(`${BACKENDS.go.url}/api/strangle/execute`, {
-                callSymbol: symbols.callSymbol,
-                putSymbol: symbols.putSymbol,
-                quantity: qty,
-                autoTrade, // Enable Go's automated management
-                orderType: 'MARKET',
-                product: 'NRML'
-            });
+        console.log('✅ Execution Success:', response.data.message);
 
-            return res.json(response.data);
-        } else {
-            // Use Python API
-            console.log('🚀 Executing via Python API...');
-            const response = await axios.post(`${BACKENDS.python.url}/execute_strangle`, req.body);
-            res.json(response.data);
-        }
+        // Return enhanced response with metadata
+        res.json({
+            status: 'success',
+            message: response.data.message,
+            execution_details: {
+                call_symbol: response.data.call_symbol,
+                put_symbol: response.data.put_symbol,
+                call_entry: response.data.call_entry_price,
+                put_entry: response.data.put_entry_price,
+                total_credit: response.data.estimated_credit,
+                auto_management: response.data.auto_management
+            },
+            metadata: response.data.metadata,
+            backend: 'go_api'
+        });
 
     } catch (error) {
         console.error('❌ Execution failed:', error.message);
+
+        // Provide detailed error information
+        const errorMsg = error.response?.data?.error || error.message;
         res.status(502).json({
             status: 'error',
-            message: error.response?.data?.message || error.message
+            message: `Execution failed: ${errorMsg}`,
+            backend: 'go_api',
+            timestamp: new Date().toISOString()
         });
     }
 });
 
-// Close Position (Go API Only)
-app.post('/close_position', async (req, res) => {
-    if (!BACKENDS.go.enabled) {
-        return res.json({
-            success: false,
-            message: 'Position management requires Go API. Enable it in BACKENDS config.'
-        });
-    }
+// ============================================
+// POSITION MANAGEMENT - Go API Only
+// ============================================
 
+app.post('/close_position', async (req, res) => {
     try {
         const { tradingSymbol, quantity } = req.body;
+
+        console.log(`🔴 Closing position: ${tradingSymbol} (${quantity} qty)`);
+
         const response = await axios.post(`${BACKENDS.go.url}/api/position/close`, {
             tradingSymbol,
-            quantity,
-            orderType: 'MARKET'
+            quantity: parseInt(quantity)
         });
-        res.json(response.data);
+
+        res.json({
+            success: true,
+            message: response.data.message,
+            realized_pnl: response.data.realized_pnl,
+            backend: 'go_api'
+        });
+
     } catch (error) {
         console.error('❌ Close position failed:', error.message);
-        res.status(502).json({ success: false, message: error.message });
-    }
-});
-
-// Close All Positions (Go API Only)
-app.post('/close_all_positions', async (req, res) => {
-    if (!BACKENDS.go.enabled) {
-        return res.json({
+        res.status(502).json({
             success: false,
-            message: 'Bulk operations require Go API'
+            message: error.response?.data?.error || error.message
         });
     }
+});
 
+app.post('/close_all_positions', async (req, res) => {
     try {
+        console.log('🔴 Closing ALL positions...');
+
         const response = await axios.post(`${BACKENDS.go.url}/api/positions/close-all`);
-        res.json(response.data);
+
+        res.json({
+            success: true,
+            message: response.data.message,
+            total_pnl: response.data.total_pnl,
+            closed_count: response.data.closed_count,
+            backend: 'go_api'
+        });
+
     } catch (error) {
         console.error('❌ Close all failed:', error.message);
-        res.status(502).json({ success: false, message: error.message });
+        res.status(502).json({
+            success: false,
+            message: error.response?.data?.error || error.message
+        });
     }
 });
 
-// System Status - Check both backends
+// ============================================
+// SYSTEM STATUS - Check Both Backends
+// ============================================
+
 app.get('/api/system_status', async (req, res) => {
     const status = {
         python: { available: false, url: BACKENDS.python.url },
-        go: { available: false, url: BACKENDS.go.url },
+        go: { available: false, url: BACKENDS.go.url, features: {} },
         activeBackend: BACKENDS.go.enabled ? 'go' : 'python',
         features: {
             analytics: true,
-            execution: true,
-            positionManagement: BACKENDS.go.enabled,
-            riskManagement: BACKENDS.go.enabled,
-            autoTrading: BACKENDS.go.enabled
-        }
+            execution: false,
+            positionManagement: false,
+            riskManagement: false,
+            autoTrading: false
+        },
+        timestamp: new Date().toISOString()
     };
 
     // Test Python
     try {
         await axios.get(`${BACKENDS.python.url}/analyze`, { timeout: 2000 });
         status.python.available = true;
+        status.features.analytics = true;
     } catch (error) {
         console.warn('⚠️ Python backend unavailable');
     }
 
     // Test Go
-    if (BACKENDS.go.enabled) {
-        try {
-            await axios.get(`${BACKENDS.go.url}/health`, { timeout: 2000 });
-            status.go.available = true;
-        } catch (error) {
-            console.warn('⚠️ Go backend unavailable');
+    try {
+        const goResponse = await axios.get(`${BACKENDS.go.url}/health`, { timeout: 2000 });
+        status.go.available = true;
+        status.go.features = goResponse.data.features;
+
+        // Enable features if Go is available
+        if (status.go.available) {
+            status.features.execution = true;
+            status.features.positionManagement = true;
+            status.features.riskManagement = true;
+            status.features.autoTrading = true;
         }
+    } catch (error) {
+        console.warn('⚠️ Go backend unavailable');
     }
 
     res.json(status);
@@ -706,12 +787,13 @@ const getHtml = () => `
             return currentCost;
         }
 
+           // Execute Strangle with Go API
         async function executeStrangle() {
             if (!globalData || !globalData.strangle_intel) return;
             
             const intel = globalData.strangle_intel[currentProfile];
-            // Updated ALERT message to reflect 75 Qty
-            if (!confirm(\`EXECUTE STRANGLE (1 Lot - 75 Qty)?\\n\\nSell Call: \${intel.rec_call}\\nSell Put: \${intel.rec_put}\\n\\nProceed?\`)) return;
+            
+            if (!confirm(\`EXECUTE STRANGLE via GO API?\\n\\nCall: \${intel.rec_call}\\nPut: \${intel.rec_put}\\nQty: 75\\n\\n✅ Auto Risk Management: ENABLED\\n\\nProceed?\`)) return;
             
             try {
                 const res = await fetch('/execute_strangle', {
@@ -720,17 +802,20 @@ const getHtml = () => `
                     body: JSON.stringify({
                         call_strike: intel.rec_call,
                         put_strike: intel.rec_put,
-                        qty: 75 // CHANGED: Set to 75 as per user request
+                        qty: 75,
+                        autoTrade: true  // ✅ Enable Go's auto-management
                     })
                 });
+                
                 const result = await res.json();
+                
                 if(result.status === 'success') {
-                    alert("Order Executed!");
+                    alert(\`✅ Order Executed Successfully!\\n\\nCall: \${result.execution_details.call_symbol} @ \${result.execution_details.call_entry}\\nPut: \${result.execution_details.put_symbol} @ \${result.execution_details.put_entry}\\n\\nTotal Credit: \${result.execution_details.total_credit}\\n\\n🤖 Auto Management: ACTIVE\`);
                 } else {
-                    alert(" Error: " + result.message);
+                    alert('❌ Error: ' + result.message);
                 }
             } catch(e) {
-                alert(" Network Error");
+                alert('❌ Network Error: ' + e.message);
             }
         }
 
@@ -1055,6 +1140,8 @@ const getHtml = () => `
         toggleStrangleChart();
         togglePositions(); // Initialize toggle state
         setInterval(() => updateDashboard(false), 2000);
+        console.log('🚀 Dashboard initializing with Go API...');
+        checkSystemStatus();
         setInterval(checkSystemStatus, 30000); // Check status every 30s
     </script>
 </body>
@@ -1064,18 +1151,29 @@ const getHtml = () => `
 
 app.get('/', (req, res) => res.send(getHtml()));
 
-app.listen(PORT, () => {
+// ============================================
+// START SERVER
+// ============================================
+
+app.listen(PORT, async () => {
     console.log(`
-╔════════════════════════════════════════════════════════════╗
-║     NIFTY OPTIONS DASHBOARD - HYBRID BACKEND READY        ║
-╠════════════════════════════════════════════════════════════╣
+╔═══════════════════════════════════════════════════════════╗
+║     NIFTY OPTIONS DASHBOARD - GO API INTEGRATION          ║
+╠═══════════════════════════════════════════════════════════╣
 ║  Dashboard:      http://localhost:${PORT}                     ║
 ║  Python API:     ${BACKENDS.python.url}                  ║
-║  Go API:         ${BACKENDS.go.url} (${BACKENDS.go.enabled ? 'ENABLED' : 'DISABLED'})     ║
-╠════════════════════════════════════════════════════════════╣
+║  Go API:         ${BACKENDS.go.url}                      ║
+╠═══════════════════════════════════════════════════════════╣
 ║  Analytics:      Python (Best Intelligence)               ║
-║  Execution:      ${BACKENDS.go.enabled ? 'Go API (Managed)' : 'Python (Manual)'}                  ║
-║  Positions:      ${BACKENDS.go.enabled ? 'Go API (Advanced)' : 'Python (Basic)'}                ║
-╚════════════════════════════════════════════════════════════╝
+║  Execution:      Go API (Intelligent + Auto Mgmt)         ║
+║  Positions:      Go API (Real-time Monitoring)            ║
+╚═══════════════════════════════════════════════════════════╝
     `);
+
+    // Check Go API availability on startup
+    const goAvailable = await checkGoAPI();
+    if (!goAvailable) {
+        console.warn('⚠️  WARNING: Go API is not running!');
+        console.warn('    Start it with: go run cmd/api/server.go');
+    }
 });

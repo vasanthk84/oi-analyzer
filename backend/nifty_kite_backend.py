@@ -1,5 +1,5 @@
 import uvicorn
-from fastapi import FastAPI, HTTPException, Body, Request
+from fastapi import FastAPI, HTTPException, Body, Request, BackgroundTasks
 from kiteconnect import KiteConnect
 import pandas as pd
 import numpy as np
@@ -11,10 +11,15 @@ import sqlite3
 import math
 from dotenv import load_dotenv
 import json 
+from journal_manager import TradingJournal
+import asyncio
+import httpx
+import uuid
 
 from fastapi.responses import StreamingResponse
 import asyncio
 from fastapi.middleware.cors import CORSMiddleware
+from trade_autopsy import TradeAutopsy, get_trade_autopsy
 
 
 
@@ -73,6 +78,31 @@ def init_db():
     conn.close()
 
 init_db()
+
+journal = TradingJournal()  # Initialize journal
+print("✅ Trading Journal initialized")
+
+@app.on_event("startup")
+async def startup_event():
+    """Start background position sync"""
+    asyncio.create_task(sync_positions_periodically())
+
+async def sync_positions_periodically():
+    """Runs every 5 minutes to detect Zerodha app trades"""
+    while True:
+        try:
+            await asyncio.sleep(300)  # 5 minutes
+            
+            # Call sync endpoint
+            async with httpx.AsyncClient() as client:
+                response = await client.post('http://localhost:8000/journal/sync_positions')
+                result = response.json()
+                
+                if result['new_trades_synced'] > 0:
+                    logger.info(f"🆕 Detected {result['new_trades_synced']} Zerodha app trades")
+                    
+        except Exception as e:
+            logger.error(f"Position sync error: {e}")
 
 # ============================================
 # REAL-TIME POSITION STREAMING (SSE)
@@ -327,6 +357,211 @@ def close_position(payload: dict = Body(...)):
             "success": False,
             "message": str(e)
         }
+
+# ============================================
+# TRADE AUTOPSY ENDPOINTS
+# ============================================
+
+@app.get("/api/journal/closed_trades")
+async def get_closed_trades(limit: int = 10):
+    """
+    Get list of recently closed trades for autopsy selection
+    """
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        
+        query = '''
+            SELECT 
+                trade_id, symbol, instrument_type, strike,
+                entry_time, exit_time, entry_price, exit_price,
+                realized_pnl, realized_pnl_pct, hold_duration_minutes,
+                exit_reason, emotional_state
+            FROM trades
+            WHERE exit_time IS NOT NULL
+            ORDER BY exit_time DESC
+            LIMIT ?
+        '''
+        
+        df = pd.read_sql_query(query, conn, params=(limit,))
+        conn.close()
+        
+        trades = df.to_dict('records')
+        
+        return {
+            "success": True,
+            "trades": trades
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to fetch closed trades: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/journal/trade_autopsy/{trade_id}")
+async def analyze_trade(trade_id: str):
+    """
+    Get complete post-trade autopsy analysis
+    
+    This is the main endpoint that provides:
+    - What went right
+    - What went wrong
+    - Detailed analysis of timing, position quality, exit decision
+    - Greek behavior analysis
+    - Emotional factors
+    - Key lessons
+    - Actionable next-time checklist
+    """
+    try:
+        autopsy = get_trade_autopsy(trade_id)
+        
+        if "error" in autopsy:
+            return {"success": False, "error": autopsy["error"]}
+        
+        return {
+            "success": True,
+            "autopsy": autopsy
+        }
+        
+    except Exception as e:
+        logger.error(f"Trade autopsy failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/journal/common_mistakes")
+async def get_common_mistakes(days: int = 30):
+    """
+    Identify most common mistakes across all trades in period
+    """
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        
+        # Get all closed trades in period
+        query = '''
+            SELECT trade_id
+            FROM trades
+            WHERE exit_time >= datetime('now', '-{} days')
+            AND exit_time IS NOT NULL
+        '''.format(days)
+        
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+        
+        # Run autopsy on each trade
+        all_mistakes = []
+        all_lessons = []
+        
+        for trade_id in df['trade_id']:
+            autopsy = get_trade_autopsy(trade_id)
+            
+            if "error" not in autopsy:
+                all_mistakes.extend(autopsy.get("what_went_wrong", []))
+                all_lessons.extend(autopsy.get("lessons", []))
+        
+        # Count frequency of each mistake
+        from collections import Counter
+        mistake_counts = Counter(all_mistakes)
+        lesson_counts = Counter(all_lessons)
+        
+        # Get top mistakes
+        top_mistakes = [
+            {"mistake": mistake, "count": count}
+            for mistake, count in mistake_counts.most_common(10)
+        ]
+        
+        # Get top lessons
+        top_lessons = [
+            {"lesson": lesson, "count": count}
+            for lesson, count in lesson_counts.most_common(10)
+        ]
+        
+        return {
+            "success": True,
+            "period_days": days,
+            "total_trades_analyzed": len(df),
+            "top_mistakes": top_mistakes,
+            "top_lessons": top_lessons,
+            "insights": {
+                "most_common_issue": top_mistakes[0]["mistake"] if top_mistakes else "None",
+                "repeat_offender": top_mistakes[0]["count"] >= 3 if top_mistakes else False
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Common mistakes analysis failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/journal/improvement_score")
+async def get_improvement_score(days: int = 7):
+    """
+    Track if you're improving over time
+    Compares recent performance to older trades
+    """
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        
+        # Recent trades
+        query_recent = '''
+            SELECT 
+                AVG(CASE WHEN realized_pnl > 0 THEN 1.0 ELSE 0.0 END) as win_rate,
+                AVG(realized_pnl) as avg_pnl,
+                COUNT(*) as trade_count
+            FROM trades
+            WHERE exit_time >= datetime('now', '-{} days')
+            AND exit_time IS NOT NULL
+        '''.format(days)
+        
+        recent = pd.read_sql_query(query_recent, conn).iloc[0]
+        
+        # Previous period
+        query_prev = '''
+            SELECT 
+                AVG(CASE WHEN realized_pnl > 0 THEN 1.0 ELSE 0.0 END) as win_rate,
+                AVG(realized_pnl) as avg_pnl,
+                COUNT(*) as trade_count
+            FROM trades
+            WHERE exit_time >= datetime('now', '-{} days')
+            AND exit_time < datetime('now', '-{} days')
+            AND exit_time IS NOT NULL
+        '''.format(days * 2, days)
+        
+        previous = pd.read_sql_query(query_prev, conn).iloc[0]
+        
+        conn.close()
+        
+        # Calculate improvement
+        win_rate_change = (recent['win_rate'] - previous['win_rate']) * 100
+        avg_pnl_change = recent['avg_pnl'] - previous['avg_pnl']
+        
+        improving = win_rate_change > 0 or avg_pnl_change > 0
+        
+        return {
+            "success": True,
+            "recent_period": {
+                "days": days,
+                "win_rate": round(recent['win_rate'] * 100, 1),
+                "avg_pnl": round(recent['avg_pnl'], 0),
+                "trade_count": int(recent['trade_count'])
+            },
+            "previous_period": {
+                "days": days,
+                "win_rate": round(previous['win_rate'] * 100, 1),
+                "avg_pnl": round(previous['avg_pnl'], 0),
+                "trade_count": int(previous['trade_count'])
+            },
+            "improvement": {
+                "win_rate_change": round(win_rate_change, 1),
+                "avg_pnl_change": round(avg_pnl_change, 0),
+                "is_improving": improving,
+                "message": "You're improving! 🎉" if improving else "Focus on lessons to improve"
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Improvement score failed: {e}")
+        return {"success": False, "error": str(e)}
     
 # ============================================
 # SYSTEM CAPABILITIES ENDPOINT
@@ -359,6 +594,361 @@ def get_capabilities():
             "historical": "/historical_analysis"
         }
     }
+
+
+@app.post("/journal/record_entry")
+async def record_trade_entry(payload: dict = Body(...)):
+    """Record trade entry in journal"""
+    try:
+        trade_id = journal.record_trade_entry(
+            position_data=payload["position_data"],
+            market_context=payload["market_context"],
+            source=payload.get("source", "app_auto"),
+            session_id=payload.get("session_id")
+        )
+        
+        logger.info(f"✅ Journal Entry: {payload['position_data']['tradingsymbol']} (ID: {trade_id[:8]})")
+        
+        return {
+            "success": True,
+            "trade_id": trade_id,
+            "message": "Trade recorded in journal"
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Journal entry failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/journal/record_exit")
+async def record_trade_exit(payload: dict = Body(...)):
+    """Record trade exit in journal"""
+    try:
+        success = journal.record_trade_exit(
+            trade_id=payload["trade_id"],
+            exit_data=payload["exit_data"],
+            market_context=payload["market_context"],
+            exit_reason=payload.get("exit_reason", "manual"),
+            emotional_state=payload.get("emotional_state"),
+            notes=payload.get("notes")
+        )
+        
+        if success:
+            return {
+                "success": True,
+                "message": "Trade exit recorded"
+            }
+        else:
+            return {
+                "success": False,
+                "error": "Trade not found or already closed"
+            }
+            
+    except Exception as e:
+        logger.error(f"❌ Journal exit failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/journal/sync_positions")
+async def sync_zerodha_positions():
+    """Sync Zerodha positions to detect manual trades"""
+    try:
+        positions_data = kite.positions()
+        net = positions_data['net']
+        
+        journal_positions = journal.get_open_positions()
+        journal_symbols = {p['symbol'] for p in journal_positions}
+        
+        new_trades_found = 0
+        
+        for pos in net:
+            if 'NIFTY' not in pos.get('tradingsymbol', ''):
+                continue
+            
+            symbol = pos['tradingsymbol']
+            
+            if symbol not in journal_symbols and pos['quantity'] != 0:
+                existing = journal.find_trade_by_symbol(symbol, pos['average_price'])
+                
+                if not existing:
+                    spot = kite.quote(["NSE:NIFTY 50"])["NSE:NIFTY 50"]["last_price"]
+                    vix = kite.quote(["NSE:INDIA VIX"])["NSE:INDIA VIX"]["last_price"]
+                    
+                    market_context = {
+                        "spot": spot,
+                        "vix": vix,
+                        "iv_rank": 50.0,
+                        "dte": 1.0,
+                        "delta": None,
+                        "gamma": None,
+                        "theta": None
+                    }
+                    
+                    position_data = {
+                        "tradingsymbol": symbol,
+                        "quantity": abs(pos['quantity']),
+                        "average_price": pos['average_price'],
+                        "order_id": None
+                    }
+                    
+                    journal.record_trade_entry(
+                        position_data=position_data,
+                        market_context=market_context,
+                        source="zerodha_app"
+                    )
+                    
+                    new_trades_found += 1
+                    logger.info(f"🆕 Detected Zerodha app trade: {symbol}")
+        
+        return {
+            "success": True,
+            "new_trades_synced": new_trades_found,
+            "message": f"Synced {new_trades_found} Zerodha app trades"
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Position sync failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/journal/performance")
+async def get_performance_summary(days: int = 30):
+    """Get performance analytics"""
+    try:
+        summary = journal.get_performance_summary(days=days)
+        insights = generate_behavioral_insights(summary)
+        
+        return {
+            "success": True,
+            "period_days": days,
+            "overall_stats": summary["overall"],
+            "win_rate": summary["win_rate"],
+            "by_day_of_week": summary["by_day_of_week"],
+            "expiry_performance": summary["expiry_day_analysis"],
+            "emotional_analysis": summary["emotional_analysis"],
+            "vix_correlation": summary["vix_correlation"],
+            "behavioral_insights": insights
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Performance summary failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/journal/lessons")
+async def get_trading_lessons(limit: int = 10):
+    """Get recent trading lessons"""
+    try:
+        lessons = journal.get_recent_lessons(limit=limit)
+        return {
+            "success": True,
+            "lessons": lessons
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/journal/add_lesson")
+async def add_lesson(payload: dict = Body(...)):
+    """Add a trading lesson"""
+    try:
+        journal.add_lesson(
+            lesson_text=payload["lesson_text"],
+            category=payload["category"],
+            severity=payload.get("severity", "minor"),
+            trade_id=payload.get("trade_id"),
+            action_plan=payload.get("action_plan")
+        )
+        return {"success": True, "message": "Lesson recorded"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# ============================================
+# DATE-DRIVEN ENDPOINTS (UPDATED)
+# ============================================
+
+@app.get("/api/journal/closed_trades")
+async def get_closed_trades(
+    start: str = None,  # Format: YYYY-MM-DD
+    end: str = None,
+    limit: int = 50
+):
+    """Get closed trades filtered by date range"""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        
+        # Build query with date filters
+        query = '''
+            SELECT 
+                trade_id, symbol, instrument_type, strike,
+                entry_time, exit_time, entry_price, exit_price,
+                realized_pnl, realized_pnl_pct, hold_duration_minutes,
+                exit_reason, emotional_state
+            FROM trades
+            WHERE exit_time IS NOT NULL
+        '''
+        
+        params = []
+        if start:
+            query += ' AND DATE(exit_time) >= ?'
+            params.append(start)
+        if end:
+            query += ' AND DATE(exit_time) <= ?'
+            params.append(end)
+            
+        query += ' ORDER BY exit_time DESC LIMIT ?'
+        params.append(limit)
+        
+        df = pd.read_sql_query(query, conn, params=params)
+        conn.close()
+        
+        return {
+            "success": True,
+            "trades": df.to_dict('records'),
+            "period": {"start": start, "end": end},
+            "count": len(df)
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to fetch closed trades: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/journal/performance")
+async def get_performance_summary(
+    start: str = None,
+    end: str = None,
+    days: int = None  # Fallback if dates not provided
+):
+    """Get performance summary for date range"""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        
+        # Build date filter
+        date_filter = ""
+        params = []
+        
+        if start and end:
+            date_filter = "WHERE exit_time >= ? AND exit_time <= ?"
+            params = [f"{start} 00:00:00", f"{end} 23:59:59"]
+        elif days:
+            date_filter = f"WHERE exit_time >= datetime('now', '-{days} days')"
+        else:
+            # Default to last 30 days
+            date_filter = "WHERE exit_time >= datetime('now', '-30 days')"
+        
+        # Overall Stats
+        query_overall = f'''
+            SELECT 
+                COUNT(*) as total_trades,
+                SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) as winning_trades,
+                SUM(realized_pnl) as total_pnl,
+                AVG(realized_pnl) as avg_pnl,
+                MAX(realized_pnl) as largest_win,
+                MIN(realized_pnl) as largest_loss,
+                AVG(hold_duration_minutes) as avg_hold_minutes
+            FROM trades
+            {date_filter}
+        '''
+        
+        df_overall = pd.read_sql_query(query_overall, conn, params=params)
+        overall = df_overall.to_dict('records')[0]
+        
+        # Calculate win rate
+        total = overall.get('total_trades', 0)
+        wins = overall.get('winning_trades', 0)
+        win_rate = round((wins / total * 100), 2) if total > 0 else 0
+        
+        conn.close()
+        
+        return {
+            "success": True,
+            "overall_stats": overall,
+            "win_rate": win_rate,
+            "period": {"start": start, "end": end, "days": days},
+            "timestamp": datetime.now(pytz.timezone('Asia/Kolkata')).isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Performance summary failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/journal/export")
+async def export_journal_csv(start: str = None, end: str = None):
+    """Export trades as CSV for date range"""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        
+        query = "SELECT * FROM trades WHERE exit_time IS NOT NULL"
+        params = []
+        
+        if start:
+            query += " AND DATE(exit_time) >= ?"
+            params.append(start)
+        if end:
+            query += " AND DATE(exit_time) <= ?"
+            params.append(end)
+            
+        query += " ORDER BY exit_time DESC"
+        
+        df = pd.read_sql_query(query, conn, params=params)
+        conn.close()
+        
+        # Convert to CSV
+        csv_data = df.to_csv(index=False)
+        filename = f"trades_{start}_{end}.csv" if start and end else "trades_export.csv"
+        
+        return StreamingResponse(
+            iter([csv_data]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+        
+    except Exception as e:
+        logger.error(f"CSV export failed: {e}")
+        return {"success": False, "error": str(e)}
+
+def generate_behavioral_insights(summary: dict) -> dict:
+    """Generate actionable insights from trading data"""
+    insights = {
+        "warnings": [],
+        "strengths": [],
+        "recommendations": []
+    }
+    
+    # Emotional trading analysis
+    emotional_data = summary.get("emotional_analysis", [])
+    for emotion in emotional_data:
+        if emotion["emotional_state"] == "fearful" and emotion["win_rate"] < 40:
+            insights["warnings"].append(
+                f"Fear-based exits have only {emotion['win_rate']:.1f}% success rate. "
+                "Consider waiting 15 minutes before panic exits."
+            )
+        
+        if emotion["emotional_state"] == "calm" and emotion["win_rate"] > 60:
+            insights["strengths"].append(
+                f"Calm trading shows {emotion['win_rate']:.1f}% win rate. "
+                "Maintain this discipline."
+            )
+    
+    # Day of week patterns
+    dow_data = summary.get("by_day_of_week", [])
+    if dow_data:
+        worst_day = min(dow_data, key=lambda x: x.get("win_rate", 0))
+        best_day = max(dow_data, key=lambda x: x.get("win_rate", 0))
+        
+        insights["warnings"].append(
+            f"Weakest performance on {worst_day['day_of_week']} "
+            f"({worst_day['win_rate']:.1f}% win rate)"
+        )
+        insights["strengths"].append(
+            f"Best performance on {best_day['day_of_week']} "
+            f"({best_day['win_rate']:.1f}% win rate)"
+        )
+    
+    return insights
 
 # ============================================
 # USAGE INSTRUCTIONS
@@ -701,6 +1291,45 @@ def execute_strangle(payload: dict = Body(...)):
         if not call_symbol or not put_symbol: raise HTTPException(status_code=400, detail="Invalid Strikes. Refresh Instruments.")
         order_id_ce = kite.place_order(tradingsymbol=call_symbol, exchange=kite.EXCHANGE_NFO, transaction_type=kite.TRANSACTION_TYPE_SELL, quantity=qty, order_type=kite.ORDER_TYPE_MARKET, product=kite.PRODUCT_MIS, variety=kite.VARIETY_REGULAR)
         order_id_pe = kite.place_order(tradingsymbol=put_symbol, exchange=kite.EXCHANGE_NFO, transaction_type=kite.TRANSACTION_TYPE_SELL, quantity=qty, order_type=kite.ORDER_TYPE_MARKET, product=kite.PRODUCT_MIS, variety=kite.VARIETY_REGULAR)
+         # Prepare market context
+        market_context = {
+            'spot': nifty_spot,
+            'vix': vix_val,
+            'iv_rank': iv_rank_data["rank"],
+            'dte': days_to_expiry,
+            'delta': c_greeks['delta'],
+            'gamma': atm_greeks['gamma'],
+            'theta': c_greeks['theta']
+        }
+        
+        # Generate session ID to link CE and PE together
+        session_id = str(uuid.uuid4())
+        
+        # Record CE entry
+        ce_trade_id = journal.record_trade_entry(
+            {
+                'tradingsymbol': call_symbol,
+                'quantity': qty,
+                'average_price': ceFilledPrice,
+                'order_id': order_id_ce
+            },
+            market_context,
+            source='app_auto',
+            session_id=session_id
+        )
+        
+        # Record PE entry
+        pe_trade_id = journal.record_trade_entry(
+            {
+                'tradingsymbol': put_symbol,
+                'quantity': qty,
+                'average_price': peFilledPrice,
+                'order_id': order_id_pe
+            },
+            market_context,
+            source='app_auto',
+            session_id=session_id
+        )
         return {"status": "success", "message": f"Orders Placed. IDs: {order_id_ce}, {order_id_pe}", "executed_strikes": {"call": call_strike, "put": put_strike}}
     except Exception as e:
         logger.error(f"Execution Failed: {e}")

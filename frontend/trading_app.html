@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nifty Trading Platform - Enterprise</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { 
+            background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); 
+            color: #e2e8f0; 
+            font-family: 'Inter', sans-serif; 
+            min-height: 100vh; 
+        }
+        .glass-panel { 
+            background: rgba(30, 41, 59, 0.7); 
+            backdrop-filter: blur(10px); 
+            border: 1px solid rgba(255,255,255,0.1); 
+        }
+        .stat-card { transition: transform 0.2s; }
+        .stat-card:hover { transform: translateY(-4px); }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, createContext, useContext, useMemo } = React;
+
+        // ============================================
+        // DATE CONTEXT - Global State for Date Filtering
+        // ============================================
+        const DateContext = createContext();
+
+        const DateProvider = ({ children }) => {
+            const [dateRange, setDateRange] = useState('thisMonth');
+            const [customStart, setCustomStart] = useState('');
+            const [customEnd, setCustomEnd] = useState('');
+            
+            const calculateDates = useMemo(() => {
+                const end = new Date();
+                let start = new Date();
+                
+                switch(dateRange) {
+                    case 'today':
+                        start = new Date();
+                        break;
+                    case 'thisWeek':
+                        start.setDate(end.getDate() - 7);
+                        break;
+                    case 'thisMonth':
+                        start.setDate(end.getDate() - 30);
+                        break;
+                    case 'lastMonth':
+                        start.setDate(end.getDate() - 60);
+                        end.setDate(end.getDate() - 30);
+                        break;
+                    case 'last3Months':
+                        start.setDate(end.getDate() - 90);
+                        break;
+                    case 'custom':
+                        if (customStart && customEnd) {
+                            return {
+                                start: customStart,
+                                end: customEnd,
+                                label: `${customStart} to ${customEnd}`
+                            };
+                        }
+                        break;
+                }
+                
+                return {
+                    start: start.toISOString().split('T')[0],
+                    end: end.toISOString().split('T')[0],
+                    label: dateRange
+                };
+            }, [dateRange, customStart, customEnd]);
+
+            return (
+                <DateContext.Provider value={{
+                    dateRange, setDateRange,
+                    customStart, setCustomStart,
+                    customEnd, setCustomEnd,
+                    dates: calculateDates
+                }}>
+                    {children}
+                </DateContext.Provider>
+            );
+        };
+
+        const useDateContext = () => useContext(DateContext);
+
+        // ============================================
+        // DATE SELECTOR COMPONENT - Reusable
+        // ============================================
+        const DateSelector = ({ showCompare = false }) => {
+            const { dateRange, setDateRange, customStart, setCustomStart, customEnd, setCustomEnd, dates } = useDateContext();
+            const [showCustom, setShowCustom] = useState(false);
+
+            const datePresets = [
+                { value: 'today', label: 'Today' },
+                { value: 'thisWeek', label: 'This Week' },
+                { value: 'thisMonth', label: 'This Month' },
+                { value: 'lastMonth', label: 'Last Month' },
+                { value: 'last3Months', label: 'Last 3 Months' },
+                { value: 'custom', label: 'Custom' }
+            ];
+
+            return (
+                <div className="space-y-4">
+                    <div className="grid grid-cols-2 lg:grid-cols-6 gap-3">
+                        {datePresets.map(preset => (
+                            <button
+                                key={preset.value}
+                                onClick={() => {
+                                    setDateRange(preset.value);
+                                    setShowCustom(preset.value === 'custom');
+                                }}
+                                className={`px-4 py-2 rounded-lg font-medium transition ${
+                                    dateRange === preset.value
+                                        ? 'bg-cyan-600 text-white shadow-lg'
+                                        : 'bg-slate-700 text-slate-300 hover:bg-slate-600'
+                                }`}
+                            >
+                                {preset.label}
+                            </button>
+                        ))}
+                    </div>
+
+                    {showCustom && (
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 p-4 bg-slate-900/50 rounded-lg border border-slate-600">
+                            <div>
+                                <label className="block text-sm font-medium text-slate-300 mb-2">Start Date</label>
+                                <input
+                                    type="date"
+                                    value={customStart}
+                                    onChange={(e) => setCustomStart(e.target.value)}
+                                    className="w-full bg-slate-800 border border-slate-600 rounded-lg px-4 py-2 text-white"
+                                />
+                            </div>
+                            <div>
+                                <label className="block text-sm font-medium text-slate-300 mb-2">End Date</label>
+                                <input
+                                    type="date"
+                                    value={customEnd}
+                                    onChange={(e) => setCustomEnd(e.target.value)}
+                                    className="w-full bg-slate-800 border border-slate-600 rounded-lg px-4 py-2 text-white"
+                                />
+                            </div>
+                        </div>
+                    )}
+
+                    <div className="text-sm text-slate-400">
+                        📅 Viewing: <span className="text-white font-medium">{dates.label}</span>
+                    </div>
+                </div>
+            );
+        };
+
+        // ============================================
+        // TRADING JOURNAL PAGE
+        // ============================================
+        const TradingJournal = ({ onNavigate }) => {
+            const { dates } = useDateContext();
+            const [performanceData, setPerformanceData] = useState(null);
+            const [loading, setLoading] = useState(false);
+
+            useEffect(() => {
+                fetchData();
+            }, [dates]);
+
+            const fetchData = async () => {
+                setLoading(true);
+                try {
+                    const res = await fetch(`/api/journal/performance?start=${dates.start}&end=${dates.end}`);
+                    const data = await res.json();
+                    setPerformanceData(data);
+                } catch (error) {
+                    console.error('Failed to load performance data:', error);
+                } finally {
+                    setLoading(false);
+                }
+            };
+
+            const exportCSV = () => {
+                window.open(`/api/journal/export?start=${dates.start}&end=${dates.end}`, '_blank');
+            };
+
+            return (
+                <div className="min-h-screen p-6">
+                    <div className="max-w-7xl mx-auto space-y-6">
+                        
+                        {/* Header */}
+                        <div className="glass-panel rounded-xl p-6">
+                            <div className="flex justify-between items-start mb-6">
+                                <div>
+                                    <h1 className="text-3xl font-bold text-white flex items-center gap-3">
+                                        📊 Trading Journal & Analytics
+                                    </h1>
+                                    <p className="text-slate-400 mt-1">Performance insights • Behavioral patterns • Lessons learned</p>
+                                </div>
+
+                                <div className="flex gap-3">
+                                    <button 
+                                        onClick={() => onNavigate('dashboard')}
+                                        className="px-4 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded-lg font-medium transition"
+                                    >
+                                        ← Dashboard
+                                    </button>
+                                    <button 
+                                        onClick={exportCSV}
+                                        className="px-4 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded-lg font-medium transition"
+                                    >
+                                        📥 Export CSV
+                                    </button>
+                                    <button 
+                                        onClick={fetchData}
+                                        className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition"
+                                    >
+                                        🔄 Refresh
+                                    </button>
+                                </div>
+                            </div>
+
+                            <DateSelector />
+                        </div>
+
+                        {/* Performance Cards */}
+                        <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
+                            <div className="glass-panel rounded-xl p-6 border-l-4 border-green-500 stat-card">
+                                <div className="text-sm text-slate-400 uppercase tracking-wide">Win Rate</div>
+                                <div className="text-4xl font-bold text-green-400 mt-2">
+                                    {performanceData?.win_rate || '--'}%
+                                </div>
+                                <div className="text-xs text-slate-500 mt-2">
+                                    {performanceData?.overall_stats?.total_trades || 0} trades
+                                </div>
+                            </div>
+
+                            <div className="glass-panel rounded-xl p-6 border-l-4 border-blue-500 stat-card">
+                                <div className="text-sm text-slate-400 uppercase tracking-wide">Total P&L</div>
+                                <div className="text-4xl font-bold text-blue-400 mt-2">
+                                    ₹{performanceData?.overall_stats?.total_pnl?.toFixed(0) || '--'}
+                                </div>
+                                <div className="text-xs text-slate-500 mt-2">
+                                    ₹{performanceData?.overall_stats?.avg_pnl?.toFixed(0) || '--'} avg
+                                </div>
+                            </div>
+
+                            <div className="glass-panel rounded-xl p-6 border-l-4 border-orange-500 stat-card">
+                                <div className="text-sm text-slate-400 uppercase tracking-wide">Best Trade</div>
+                                <div className="text-4xl font-bold text-orange-400 mt-2">
+                                    ₹{performanceData?.overall_stats?.largest_win?.toFixed(0) || '--'}
+                                </div>
+                                <div className="text-xs text-slate-500 mt-2">Single best</div>
+                            </div>
+
+                            <div className="glass-panel rounded-xl p-6 border-l-4 border-red-500 stat-card">
+                                <div className="text-sm text-slate-400 uppercase tracking-wide">Avg Hold</div>
+                                <div className="text-4xl font-bold text-red-400 mt-2">
+                                    {Math.round(performanceData?.overall_stats?.avg_hold_minutes || 0)}
+                                </div>
+                                <div className="text-xs text-slate-500 mt-2">minutes</div>
+                            </div>
+                        </div>
+
+                        {/* View Autopsy Button - NOW DATE-AWARE */}
+                        <div className="glass-panel rounded-xl p-6">
+                            <div className="flex justify-between items-center">
+                                <div>
+                                    <h3 className="text-xl font-bold text-white mb-2">Trade Analysis</h3>
+                                    <p className="text-slate-400 text-sm">
+                                        Deep-dive into individual trades from this period
+                                    </p>
+                                </div>
+                                <button 
+                                    onClick={() => onNavigate('autopsy')}
+                                    className="px-6 py-3 bg-red-600 hover:bg-red-700 text-white rounded-lg font-bold transition shadow-lg"
+                                >
+                                    🔬 View Trade Autopsy
+                                </button>
+                            </div>
+                        </div>
+
+                        {loading && (
+                            <div className="glass-panel rounded-xl p-12 text-center">
+                                <div className="text-2xl">⏳ Loading analytics...</div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        };
+
+        // ============================================
+        // TRADE AUTOPSY PAGE
+        // ============================================
+        const TradeAutopsy = ({ onNavigate }) => {
+            const { dates } = useDateContext();
+            const [trades, setTrades] = useState([]);
+            const [selectedTrade, setSelectedTrade] = useState(null);
+            const [autopsy, setAutopsy] = useState(null);
+            const [loading, setLoading] = useState(false);
+
+            useEffect(() => {
+                fetchTrades();
+            }, [dates]);
+
+            const fetchTrades = async () => {
+                setLoading(true);
+                try {
+                    // DATE-DRIVEN: Fetch only trades from selected period
+                    const res = await fetch(`/api/journal/closed_trades?start=${dates.start}&end=${dates.end}&limit=50`);
+                    const data = await res.json();
+                    setTrades(data.trades || []);
+                } catch (error) {
+                    console.error('Failed to load trades:', error);
+                } finally {
+                    setLoading(false);
+                }
+            };
+
+            const analyzeTrade = async (tradeId) => {
+                setLoading(true);
+                try {
+                    const res = await fetch(`/api/journal/trade_autopsy/${tradeId}`);
+                    const data = await res.json();
+                    if (data.success) {
+                        setAutopsy(data.autopsy);
+                        setSelectedTrade(tradeId);
+                        window.scrollTo({ top: 0, behavior: 'smooth' });
+                    }
+                } catch (error) {
+                    console.error('Autopsy failed:', error);
+                    alert('Failed to analyze trade');
+                } finally {
+                    setLoading(false);
+                }
+            };
+
+            return (
+                <div className="min-h-screen p-6">
+                    <div className="max-w-7xl mx-auto space-y-6">
+                        
+                        {/* Header */}
+                        <div className="glass-panel rounded-xl p-6">
+                            <div className="flex justify-between items-start mb-6">
+                                <div>
+                                    <h1 className="text-3xl font-bold text-white flex items-center gap-3">
+                                        🔬 Trade Autopsy - Post-Mortem Analysis
+                                    </h1>
+                                    <p className="text-slate-400 mt-1">What went right? What went wrong? What can you improve?</p>
+                                </div>
+
+                                <div className="flex gap-3">
+                                    <button 
+                                        onClick={() => onNavigate('journal')}
+                                        className="px-4 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded-lg font-medium transition"
+                                    >
+                                        ← Journal
+                                    </button>
+                                    <button 
+                                        onClick={() => onNavigate('dashboard')}
+                                        className="px-4 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded-lg font-medium transition"
+                                    >
+                                        ← Dashboard
+                                    </button>
+                                </div>
+                            </div>
+
+                            <DateSelector />
+                        </div>
+
+                        {/* Trade Selection */}
+                        <div className="glass-panel rounded-xl p-6">
+                            <h3 className="text-xl font-bold text-white mb-4">
+                                Select a Trade to Analyze ({trades.length} trades in period)
+                            </h3>
+                            
+                            {loading && trades.length === 0 ? (
+                                <div className="text-center py-8 text-slate-400">Loading trades...</div>
+                            ) : trades.length === 0 ? (
+                                <div className="text-center py-8 text-slate-400">No closed trades in this period</div>
+                            ) : (
+                                <div className="space-y-2 max-h-96 overflow-y-auto">
+                                    {trades.map(trade => (
+                                        <button
+                                            key={trade.trade_id}
+                                            onClick={() => analyzeTrade(trade.trade_id)}
+                                            className="w-full text-left p-4 bg-slate-800/50 hover:bg-slate-700/50 rounded-lg transition flex justify-between items-center"
+                                        >
+                                            <div>
+                                                <div className="font-bold text-white">{trade.symbol}</div>
+                                                <div className="text-xs text-slate-400">
+                                                    {new Date(trade.exit_time).toLocaleString()} • Held {trade.hold_duration_minutes} mins
+                                                </div>
+                                            </div>
+                                            <div className="text-right">
+                                                <div className={`font-bold ${trade.realized_pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                                    ₹{trade.realized_pnl?.toFixed(0)}
+                                                </div>
+                                                <div className="text-xs text-slate-400">
+                                                    {trade.realized_pnl_pct?.toFixed(1)}%
+                                                </div>
+                                            </div>
+                                        </button>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Autopsy Results */}
+                        {autopsy && (
+                            <>
+                                {/* Trade Summary */}
+                                <div className="glass-panel rounded-xl p-6">
+                                    <div className="flex justify-between items-start">
+                                        <div>
+                                            <h2 className="text-2xl font-bold text-white mb-2">{autopsy.trade_summary.symbol}</h2>
+                                            <div className="text-sm text-slate-400">{autopsy.trade_summary.entry_time} • Held {autopsy.trade_summary.hold_duration_mins} mins</div>
+                                        </div>
+                                        <div className="text-right">
+                                            <div className={`text-3xl font-bold ${autopsy.trade_summary.was_winner ? 'text-green-400' : 'text-red-400'}`}>
+                                                ₹{autopsy.trade_summary.pnl?.toFixed(0)}
+                                            </div>
+                                            <div className="text-xs text-slate-400">
+                                                {autopsy.trade_summary.pnl_pct?.toFixed(1)}%
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {/* Grades */}
+                                <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                                    <div className="glass-panel rounded-xl p-4 border-l-4 border-blue-500">
+                                        <div className="text-sm text-slate-400 uppercase">Entry Timing</div>
+                                        <div className="text-3xl font-bold text-white mt-2">{autopsy.timing_analysis.entry_timing_grade}</div>
+                                    </div>
+                                    <div className="glass-panel rounded-xl p-4 border-l-4 border-green-500">
+                                        <div className="text-sm text-slate-400 uppercase">Position Quality</div>
+                                        <div className="text-3xl font-bold text-white mt-2">{autopsy.position_quality.position_grade}</div>
+                                    </div>
+                                    <div className="glass-panel rounded-xl p-4 border-l-4 border-orange-500">
+                                        <div className="text-sm text-slate-400 uppercase">Exit Decision</div>
+                                        <div className="text-3xl font-bold text-white mt-2">{autopsy.exit_analysis.exit_grade}</div>
+                                    </div>
+                                    <div className="glass-panel rounded-xl p-4 border-l-4 border-purple-500">
+                                        <div className="text-sm text-slate-400 uppercase">Discipline</div>
+                                        <div className="text-3xl font-bold text-white mt-2">{autopsy.emotional_factors.discipline_grade}</div>
+                                    </div>
+                                </div>
+
+                                {/* What Went Right */}
+                                <div className="glass-panel rounded-xl p-6 border-l-4 border-green-500">
+                                    <h3 className="text-xl font-bold text-green-400 mb-4">✅ What You Did Right</h3>
+                                    {autopsy.what_went_right.length > 0 ? (
+                                        <div className="space-y-2">
+                                            {autopsy.what_went_right.map((item, i) => (
+                                                <div key={i} className="p-3 bg-green-900/20 border border-green-500/30 rounded-lg text-sm text-green-300">
+                                                    {item}
+                                                </div>
+                                            ))}
+                                        </div>
+                                    ) : (
+                                        <div className="text-slate-400">No positive highlights</div>
+                                    )}
+                                </div>
+
+                                {/* What Went Wrong */}
+                                <div className="glass-panel rounded-xl p-6 border-l-4 border-red-500">
+                                    <h3 className="text-xl font-bold text-red-400 mb-4">❌ What Went Wrong</h3>
+                                    {autopsy.what_went_wrong.length > 0 ? (
+                                        <div className="space-y-2">
+                                            {autopsy.what_went_wrong.map((item, i) => (
+                                                <div key={i} className="p-3 bg-red-900/20 border border-red-500/30 rounded-lg text-sm text-red-300">
+                                                    {item}
+                                                </div>
+                                            ))}
+                                        </div>
+                                    ) : (
+                                        <div className="text-slate-400">No issues identified</div>
+                                    )}
+                                </div>
+
+                                {/* Key Lessons */}
+                                <div className="glass-panel rounded-xl p-6 border-l-4 border-yellow-500">
+                                    <h3 className="text-xl font-bold text-yellow-400 mb-4">💡 Key Lessons</h3>
+                                    {autopsy.lessons.length > 0 ? (
+                                        <div className="space-y-3">
+                                            {autopsy.lessons.map((lesson, i) => (
+                                                <div key={i} className="p-4 bg-yellow-900/20 border border-yellow-500/30 rounded-lg text-sm text-yellow-200">
+                                                    💡 {lesson}
+                                                </div>
+                                            ))}
+                                        </div>
+                                    ) : (
+                                        <div className="text-slate-400">No specific lessons</div>
+                                    )}
+                                </div>
+
+                                {/* Next Time */}
+                                <div className="glass-panel rounded-xl p-6 border-l-4 border-blue-500">
+                                    <h3 className="text-xl font-bold text-blue-400 mb-4">🎯 Next Time - Action Plan</h3>
+                                    {autopsy.next_time.length > 0 ? (
+                                        <div className="space-y-3">
+                                            {autopsy.next_time.map((action, i) => (
+                                                <div key={i} className="p-4 bg-blue-900/20 border border-blue-500/30 rounded-lg text-sm text-blue-200 font-semibold">
+                                                    {action}
+                                                </div>
+                                            ))}
+                                        </div>
+                                    ) : (
+                                        <div className="text-slate-400">No action items</div>
+                                    )}
+                                </div>
+                            </>
+                        )}
+
+                        {loading && selectedTrade && (
+                            <div className="glass-panel rounded-xl p-12 text-center">
+                                <div className="text-2xl">🔬 Analyzing trade...</div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        };
+
+        // ============================================
+        // MAIN APP WITH ROUTING
+        // ============================================
+        const App = () => {
+            const [currentPage, setCurrentPage] = useState('dashboard');
+
+            const navigate = (page) => {
+                setCurrentPage(page);
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+            };
+
+            return (
+                <DateProvider>
+                    {currentPage === 'dashboard' && (
+                        <div className="min-h-screen p-6">
+                            <div className="max-w-7xl mx-auto">
+                                <div className="glass-panel rounded-xl p-6 text-center">
+                                    <h1 className="text-4xl font-bold text-white mb-4">📊 Dashboard</h1>
+                                    <p className="text-slate-400 mb-6">Your main trading dashboard is still available</p>
+                                    <div className="flex gap-4 justify-center">
+                                        <button 
+                                            onClick={() => navigate('journal')}
+                                            className="px-6 py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-bold transition shadow-lg"
+                                        >
+                                            📓 Trading Journal
+                                        </button>
+                                        <button 
+                                            onClick={() => navigate('autopsy')}
+                                            className="px-6 py-3 bg-red-600 hover:bg-red-700 text-white rounded-lg font-bold transition shadow-lg"
+                                        >
+                                            🔬 Trade Autopsy
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                    
+                    {currentPage === 'journal' && <TradingJournal onNavigate={navigate} />}
+                    {currentPage === 'autopsy' && <TradeAutopsy onNavigate={navigate} />}
+                </DateProvider>
+            );
+        };
+
+        ReactDOM.render(<App />, document.getElementById('root'));
+    </script>
+</body>
+</html>

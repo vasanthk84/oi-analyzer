@@ -1,7 +1,9 @@
 const express = require('express');
 const axios = require('axios');
+const path = require('path'); 
 const app = express();
 const PORT = 3000;
+
 
 app.use(express.json());
 
@@ -392,6 +394,330 @@ app.get('/api/system_status', async (req, res) => {
     res.json(status);
 });
 
+// Legacy routes - redirect to new app
+app.get('/journal', (req, res) => {
+    res.redirect('/trading-app?page=journal');
+});
+
+app.get('/autopsy', (req, res) => {
+    res.redirect('/trading-app?page=autopsy');
+});
+
+// Journal API proxy endpoints
+app.get('/api/journal/performance', async (req, res) => {
+    try {
+        const days = req.query.days || 30;
+        const response = await axios.get(`${BACKENDS.python.url}/journal/performance?days=${days}`);
+        res.json(response.data);
+    } catch (error) {
+        res.status(502).json({ error: "Journal API unavailable" });
+    }
+});
+
+app.get('/api/journal/lessons', async (req, res) => {
+    try {
+        const limit = req.query.limit || 10;
+        const response = await axios.get(`${BACKENDS.python.url}/journal/lessons?limit=${limit}`);
+        res.json(response.data);
+    } catch (error) {
+        res.status(502).json({ error: "Journal API unavailable" });
+    }
+});
+
+app.post('/api/journal/add_lesson', async (req, res) => {
+    try {
+        const response = await axios.post(`${BACKENDS.python.url}/journal/add_lesson`, req.body);
+        res.json(response.data);
+    } catch (error) {
+        res.status(502).json({ error: "Journal API unavailable" });
+    }
+});
+
+// Proxy the API endpoints
+app.get('/api/journal/closed_trades', async (req, res) => {
+    try {
+        const limit = req.query.limit || 10;
+        const response = await axios.get(`${BACKENDS.python.url}/api/journal/closed_trades?limit=${limit}`);
+        res.json(response.data);
+    } catch (error) {
+        res.status(502).json({ success: false, error: "API unavailable" });
+    }
+});
+
+app.get('/api/journal/trade_autopsy/:trade_id', async (req, res) => {
+    try {
+        const response = await axios.get(`${BACKENDS.python.url}/api/journal/trade_autopsy/${req.params.trade_id}`);
+        res.json(response.data);
+    } catch (error) {
+        res.status(502).json({ success: false, error: "API unavailable" });
+    }
+});
+
+// Serve the new unified app
+app.get('/trading-app', (req, res) => {
+    const appPath = path.join(__dirname, 'trading_app.html');
+    res.sendFile(appPath);
+});
+
+// Keep existing routes for backward compatibility
+app.get('/journal', (req, res) => {
+    res.redirect('/trading-app#journal');
+});
+
+app.get('/autopsy', (req, res) => {
+    res.redirect('/trading-app#autopsy');
+});
+
+app.get('/autopsy', (req, res) => {
+    res.send(`
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trade Autopsy - What Could You Have Done Better?</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); color: #e2e8f0; font-family: 'Inter', sans-serif; min-height: 100vh; }
+        .glass-panel { background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.1); }
+    </style>
+</head>
+<body class="p-6">
+    <div class="max-w-7xl mx-auto">
+        
+        <!-- Header -->
+        <div class="mb-8 flex justify-between items-center">
+            <div>
+                <h1 class="text-4xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-red-400 to-orange-500">
+                    🔍 Trade Autopsy
+                </h1>
+                <p class="text-slate-400 mt-2">Post-mortem analysis: What went right? What went wrong?</p>
+            </div>
+            <a href="/" class="px-6 py-3 bg-slate-700 hover:bg-slate-600 text-white rounded-lg font-semibold transition inline-block">
+                ← Back to Dashboard
+            </a>
+        </div>
+
+        <!-- Recent Closed Trades -->
+        <div class="glass-panel p-6 rounded-xl mb-6">
+            <h3 class="text-xl font-bold mb-4">Select a Closed Trade to Analyze</h3>
+            <div id="trades-list" class="space-y-2">
+                <div class="text-center py-4 text-slate-400">Loading trades...</div>
+            </div>
+        </div>
+
+        <!-- Autopsy Report (Initially Hidden) -->
+        <div id="autopsy-report" style="display: none;">
+            
+            <!-- Trade Summary -->
+            <div class="glass-panel p-6 rounded-xl mb-6">
+                <div class="flex justify-between items-start">
+                    <div>
+                        <h2 class="text-2xl font-bold mb-2" id="trade-symbol">--</h2>
+                        <div class="text-sm text-slate-400" id="trade-details">--</div>
+                    </div>
+                    <div class="text-right">
+                        <div class="text-3xl font-bold mb-1" id="trade-pnl">--</div>
+                        <div class="text-xs text-slate-400">P&L</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Grade Cards -->
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+                <div class="glass-panel p-4 rounded-xl border-l-4 border-blue-500">
+                    <div class="text-sm text-slate-400 uppercase tracking-wide">Entry Timing</div>
+                    <div class="text-3xl font-bold mt-2" id="timing-grade">--</div>
+                </div>
+                <div class="glass-panel p-4 rounded-xl border-l-4 border-green-500">
+                    <div class="text-sm text-slate-400 uppercase tracking-wide">Position Quality</div>
+                    <div class="text-3xl font-bold mt-2" id="position-grade">--</div>
+                </div>
+                <div class="glass-panel p-4 rounded-xl border-l-4 border-orange-500">
+                    <div class="text-sm text-slate-400 uppercase tracking-wide">Exit Decision</div>
+                    <div class="text-3xl font-bold mt-2" id="exit-grade">--</div>
+                </div>
+                <div class="glass-panel p-4 rounded-xl border-l-4 border-purple-500">
+                    <div class="text-sm text-slate-400 uppercase tracking-wide">Discipline</div>
+                    <div class="text-3xl font-bold mt-2" id="discipline-grade">--</div>
+                </div>
+            </div>
+
+            <!-- What Went Right -->
+            <div class="glass-panel p-6 rounded-xl mb-6 border-l-4 border-green-500">
+                <h3 class="text-xl font-bold mb-4 text-green-400">✅ What You Did Right</h3>
+                <div id="went-right" class="space-y-2"></div>
+            </div>
+
+            <!-- What Went Wrong -->
+            <div class="glass-panel p-6 rounded-xl mb-6 border-l-4 border-red-500">
+                <h3 class="text-xl font-bold mb-4 text-red-400">❌ What Went Wrong</h3>
+                <div id="went-wrong" class="space-y-2"></div>
+            </div>
+
+            <!-- Market Conditions -->
+            <div class="glass-panel p-6 rounded-xl mb-6">
+                <h3 class="text-xl font-bold mb-4">📊 Market Conditions</h3>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <div>
+                        <div class="text-sm text-slate-400 mb-2">VIX Environment</div>
+                        <div class="text-lg font-bold text-white" id="vix-env">--</div>
+                    </div>
+                    <div>
+                        <div class="text-sm text-slate-400 mb-2">Warnings</div>
+                        <div id="market-warnings" class="space-y-1 text-sm"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Timing Analysis -->
+            <div class="glass-panel p-6 rounded-xl mb-6">
+                <h3 class="text-xl font-bold mb-4">⏰ Entry Timing</h3>
+                <div id="timing-reasons" class="space-y-2"></div>
+            </div>
+
+            <!-- Position Quality -->
+            <div class="glass-panel p-6 rounded-xl mb-6">
+                <h3 class="text-xl font-bold mb-4">🎯 Position Quality</h3>
+                <div class="mb-4">
+                    <div class="text-lg text-white" id="strike-selection">--</div>
+                </div>
+                <div id="position-risks" class="space-y-2"></div>
+            </div>
+
+            <!-- Key Lessons -->
+            <div class="glass-panel p-6 rounded-xl mb-6 border-l-4 border-yellow-500">
+                <h3 class="text-xl font-bold mb-4 text-yellow-400">💡 Key Lessons</h3>
+                <div id="lessons" class="space-y-3"></div>
+            </div>
+
+            <!-- Next Time Action Plan -->
+            <div class="glass-panel p-6 rounded-xl border-l-4 border-blue-500">
+                <h3 class="text-xl font-bold mb-4 text-blue-400">🎯 Next Time - Action Plan</h3>
+                <div id="next-time" class="space-y-3"></div>
+            </div>
+
+        </div>
+
+    </div>
+
+    <script>
+        async function loadClosedTrades() {
+            try {
+                const res = await fetch('/api/journal/closed_trades?limit=10');
+                const data = await res.json();
+                
+                if (!data.success) return;
+                
+                const list = document.getElementById('trades-list');
+                list.innerHTML = '';
+                
+                if (data.trades.length === 0) {
+                    list.innerHTML = '<div class="text-center py-4 text-slate-400">No closed trades yet</div>';
+                    return;
+                }
+                
+                data.trades.forEach(trade => {
+                    const pnlColor = trade.realized_pnl >= 0 ? 'text-green-400' : 'text-red-400';
+                    
+                    list.innerHTML += \`
+                        <button onclick="analyzeTradeAutopsy('\${trade.trade_id}')" 
+                                class="w-full text-left p-4 bg-slate-800/50 hover:bg-slate-700/50 rounded-lg transition flex justify-between items-center">
+                            <div>
+                                <div class="font-bold text-white">\${trade.symbol}</div>
+                                <div class="text-xs text-slate-400">\${trade.exit_time.split('T')[0]} • \${trade.hold_duration_minutes} mins</div>
+                            </div>
+                            <div class="text-right">
+                                <div class="font-bold \${pnlColor}">₹\${trade.realized_pnl.toFixed(0)}</div>
+                                <div class="text-xs text-slate-400">\${trade.realized_pnl_pct.toFixed(1)}%</div>
+                            </div>
+                        </button>
+                    \`;
+                });
+                
+            } catch (error) {
+                console.error('Failed to load trades:', error);
+            }
+        }
+
+        async function analyzeTradeAutopsy(tradeId) {
+            try {
+                document.getElementById('autopsy-report').style.display = 'block';
+                document.getElementById('autopsy-report').scrollIntoView({ behavior: 'smooth' });
+                
+                const res = await fetch(\`/api/journal/trade_autopsy/\${tradeId}\`);
+                const data = await res.json();
+                
+                if (!data.success) {
+                    alert('Failed to analyze trade');
+                    return;
+                }
+                
+                const autopsy = data.autopsy;
+                const summary = autopsy.trade_summary;
+                
+                // Trade Summary
+                document.getElementById('trade-symbol').innerText = summary.symbol;
+                document.getElementById('trade-details').innerText = 
+                    \`\${summary.type} \${summary.strike} • Entry: \${summary.entry_time} • Held: \${summary.hold_duration_mins} mins\`;
+                
+                const pnlEl = document.getElementById('trade-pnl');
+                pnlEl.innerText = '₹' + summary.pnl.toFixed(0);
+                pnlEl.className = summary.was_winner ? 'text-3xl font-bold text-green-400' : 'text-3xl font-bold text-red-400';
+                
+                // Grades
+                document.getElementById('timing-grade').innerText = autopsy.timing_analysis.entry_timing_grade;
+                document.getElementById('position-grade').innerText = autopsy.position_quality.position_grade;
+                document.getElementById('exit-grade').innerText = autopsy.exit_analysis.exit_grade;
+                document.getElementById('discipline-grade').innerText = autopsy.emotional_factors.discipline_grade;
+                
+                // What Went Right/Wrong
+                document.getElementById('went-right').innerHTML = autopsy.what_went_right.length > 0 
+                    ? autopsy.what_went_right.map(i => \`<div class="p-3 bg-green-900/20 border border-green-500/30 rounded-lg text-sm text-green-300">\${i}</div>\`).join('')
+                    : '<div class="text-slate-400">Nothing positive</div>';
+                
+                document.getElementById('went-wrong').innerHTML = autopsy.what_went_wrong.length > 0
+                    ? autopsy.what_went_wrong.map(i => \`<div class="p-3 bg-red-900/20 border border-red-500/30 rounded-lg text-sm text-red-300">\${i}</div>\`).join('')
+                    : '<div class="text-slate-400">No issues</div>';
+                
+                // Market
+                document.getElementById('vix-env').innerText = autopsy.market_conditions.vix_environment;
+                document.getElementById('market-warnings').innerHTML = autopsy.market_conditions.warnings.length > 0
+                    ? autopsy.market_conditions.warnings.map(w => \`<div class="text-orange-400">⚠️ \${w}</div>\`).join('')
+                    : '<div class="text-green-400">✅ No warnings</div>';
+                
+                // Timing
+                document.getElementById('timing-reasons').innerHTML = autopsy.timing_analysis.reasons
+                    .map(r => \`<div class="p-2 text-sm text-slate-300">\${r}</div>\`).join('');
+                
+                // Position
+                document.getElementById('strike-selection').innerText = autopsy.position_quality.strike_selection;
+                document.getElementById('position-risks').innerHTML = autopsy.position_quality.risk_assessment
+                    .map(r => \`<div class="text-sm text-slate-300">\${r}</div>\`).join('');
+                
+                // Lessons
+                document.getElementById('lessons').innerHTML = autopsy.lessons.length > 0
+                    ? autopsy.lessons.map(l => \`<div class="p-4 bg-yellow-900/20 border border-yellow-500/30 rounded-lg text-sm text-yellow-200">💡 \${l}</div>\`).join('')
+                    : '<div class="text-slate-400">No lessons</div>';
+                
+                // Next Time
+                document.getElementById('next-time').innerHTML = autopsy.next_time.length > 0
+                    ? autopsy.next_time.map(a => \`<div class="p-4 bg-blue-900/20 border border-blue-500/30 rounded-lg text-sm text-blue-200">\${a}</div>\`).join('')
+                    : '<div class="text-slate-400">No action items</div>';
+                
+            } catch (error) {
+                console.error('Autopsy failed:', error);
+                alert('Failed: ' + error.message);
+            }
+        }
+
+        loadClosedTrades();
+    </script>
+</body>
+</html>
+    `);
+});
+
 // ============================================
 // HELPER FUNCTIONS
 // ============================================
@@ -476,6 +802,12 @@ const getHtml = () => `
             <p class="text-slate-400 text-sm">Exec Intelligence & Risk Management</p>
         </div>
         <div class="flex items-center gap-6">
+            <a href="/trading-app" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-semibold transition">
+                📓 Trading Journal
+            </a>
+            <a href="/trading-app?page=autopsy" class="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg font-semibold transition">
+                🔬 Trade Autopsy
+            </a>
             <button onclick="updateDashboard(true)" class="p-2 bg-slate-800 rounded-full hover:bg-slate-700 transition" title="Force Refresh">
                 <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-cyan-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
             </button>
@@ -1264,15 +1596,17 @@ app.get('/', (req, res) => res.send(getHtml()));
 app.listen(PORT, async () => {
     console.log(`
 ╔═══════════════════════════════════════════════════════════╗
-║     NIFTY OPTIONS DASHBOARD - GO API INTEGRATION          ║
+║     NIFTY OPTIONS DASHBOARD - ENTERPRISE EDITION          ║
 ╠═══════════════════════════════════════════════════════════╣
 ║  Dashboard:      http://localhost:${PORT}                     ║
+║  Trading App:    http://localhost:${PORT}/trading-app         ║
 ║  Python API:     ${BACKENDS.python.url}                  ║
 ║  Go API:         ${BACKENDS.go.url}                      ║
 ╠═══════════════════════════════════════════════════════════╣
 ║  Analytics:      Python (Best Intelligence)               ║
 ║  Execution:      Go API (Intelligent + Auto Mgmt)         ║
 ║  Positions:      Go API (Real-time Monitoring)            ║
+║  Journal:        Date-Driven Analytics                    ║
 ╚═══════════════════════════════════════════════════════════╝
     `);
 

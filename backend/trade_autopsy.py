@@ -391,27 +391,12 @@ class TradeAutopsy:
         """Analyze how Greeks impacted the trade"""
         
         greek_analysis = {
-            "delta_impact": "Unknown",
-            "gamma_impact": "Unknown",
+            "delta_change": delta_exit - delta_entry if delta_exit and delta_entry else 0,
+            "gamma_impact": "Low",
+            "delta_impact": "Stable",
             "insights": []
         }
-        
-        # Delta Movement
-        if delta_entry and delta_exit:
-            delta_change = abs(delta_exit) - abs(delta_entry)
-            
-            if delta_change > 0.10:
-                greek_analysis["delta_impact"] = "Position moved significantly closer to ATM"
-                greek_analysis["insights"].append("❌ Delta increased by >0.10 - Position was tested")
-                greek_analysis["insights"].append("→ Next time: Wider strikes or exit when delta increases >0.05")
-            elif delta_change > 0.05:
-                greek_analysis["delta_impact"] = "Moderate delta increase"
-                greek_analysis["insights"].append("⚠️ Position approached ATM - Was heading toward danger zone")
-            else:
-                greek_analysis["delta_impact"] = "Delta remained stable"
-                greek_analysis["insights"].append("✅ Strike selection was safe - Never seriously threatened")
-        
-        # Gamma Impact
+    
         if gamma:
             if gamma > 0.003:
                 greek_analysis["gamma_impact"] = "Extremely high gamma - Position was radioactive"
@@ -422,14 +407,20 @@ class TradeAutopsy:
                 greek_analysis["insights"].append("⚠️ High gamma requires active management")
             else:
                 greek_analysis["gamma_impact"] = "Manageable gamma"
-        
-        # Spot Move Impact
+            
+        # FIXED: Complete spot move impact
         if spot_move and gamma:
             estimated_delta_change = gamma * abs(spot_move)
-            
             if estimated_delta_change > 0.08:
                 greek_analysis["insights"].append(f"❌ Spot moved {spot_move:+.0f} points causing major delta shift")
                 greek_analysis["insights"].append("→ This is why you need wide strikes with low gamma")
+            else:
+                greek_analysis["delta_impact"] = "Delta remained stable"
+                greek_analysis["insights"].append("✅ Strike selection was safe - Never seriously threatened")
+        
+        # Delta stability
+        if abs(greek_analysis["delta_change"]) < 0.05:
+            greek_analysis["insights"].append("✅ Delta stable - Good position sizing")
         
         return greek_analysis
     
@@ -522,6 +513,10 @@ class TradeAutopsy:
             if "0 DTE" in warning or "High gamma" in warning:
                 autopsy["what_went_wrong"].append(f"❌ {warning}")
         
+        emotional = autopsy["emotional_factors"]
+        if emotional["discipline_grade"] in ['D', 'F']:
+            autopsy["lessons"].append("Build discipline: Pre-plan all trades in a checklist")
+
         # LESSONS LEARNED
         autopsy["lessons"] = self._extract_lessons(autopsy)
         

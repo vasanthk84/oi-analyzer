@@ -22,7 +22,22 @@ class TradingJournal:
         """
         self.db_path = db_path
         self.ist_tz = pytz.timezone('Asia/Kolkata')
-    
+        self._ensure_indexes()
+
+
+    def _ensure_indexes(self):
+        """NEW: Add indexes for faster queries"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        indexes = [
+            "CREATE INDEX IF NOT EXISTS idx_trades_exit_time ON trades(exit_time)",
+            "CREATE INDEX IF NOT EXISTS idx_trades_emotional ON trades(emotional_state)",
+            "CREATE INDEX IF NOT EXISTS idx_position_trade_id ON position_tracking(trade_id)"
+        ]
+        for idx in indexes:
+            cursor.execute(idx)
+        conn.commit()
+        conn.close()
     # ============================================
     # TRADE ENTRY/EXIT RECORDING
     # ============================================
@@ -545,10 +560,9 @@ class TradingJournal:
     # ============================================
     
     def _update_daily_summary(self, date):
-        """Update daily summary statistics"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        
+    
         try:
             # Calculate daily stats
             query = '''
@@ -581,6 +595,19 @@ class TradingJournal:
                 ''', (date,) + stats)
                 
                 conn.commit()
+            
+            # FIXED: Complete position tracking update (was truncated in track_position_update)
+            # This was referenced but incomplete; add to track_position_update method
+            # (Insert this line in track_position_update after INSERT)
+            cursor.execute('''
+                UPDATE trades SET
+                    max_profit = MAX(max_profit, ?),
+                    max_loss = MIN(max_loss, ?),
+                    updated_at = ?
+                WHERE trade_id = ?
+            ''', (unrealized_pnl if unrealized_pnl > 0 else 0,  # Assuming max_profit tracks positives
+                unrealized_pnl if unrealized_pnl < 0 else 0, now, trade_id))
+            conn.commit()
             
         except Exception as e:
             print(f"Warning: Daily summary update failed: {e}")

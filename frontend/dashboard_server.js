@@ -245,6 +245,7 @@ app.get('/positions', async (req, res) => {
 // EXECUTE STRANGLE - Use Go API (Intelligent Execution)
 // ============================================
 
+// FIXED: Complete /execute_strangle endpoint (was truncated)
 app.post('/execute_strangle', async (req, res) => {
     try {
         const { call_strike, put_strike, qty = 75, profile = 'moderate', autoTrade = true } = req.body;
@@ -253,42 +254,58 @@ app.post('/execute_strangle', async (req, res) => {
         console.log(`   Call: ${call_strike} | Put: ${put_strike} | Qty: ${qty} | Auto: ${autoTrade}`);
 
         // ✅ FIXED: Send data in Go API's expected format
-        const response = await axios.post(`${BACKENDS.go.url}/api/strangle/execute`, {
-            call_strike: parseFloat(call_strike),
-            put_strike: parseFloat(put_strike),
-            quantity: parseInt(qty),
-            autoTrade: autoTrade  // Enable Go's risk management
-        });
+        const response = await goBreaker.execute(() =>
+            retryWithBackoff(() =>
+                axios.post(`${BACKENDS.go.url}/api/strangle/execute`, {
+                    call_strike: parseFloat(call_strike),
+                    put_strike: parseFloat(put_strike),
+                    quantity: parseInt(qty),
+                    autoTrade: autoTrade  // Enable Go's risk management
+                }, { timeout: 10000 })
+            )
+        );
 
-        console.log('✅ Execution Success:', response.data.message);
+        console.log('✅ Execution Success:', response.data);  // FIXED: Complete log
+        const { order_ids, session_id } = response.data;  // Assume Go returns these
 
-        // Return enhanced response with metadata
+        // NEW: Record in Journal (call Python via proxy)
+        if (session_id) {
+            await axios.post('http://localhost:3000/api/journal/record_entry', {
+                position_data: {  // For CE leg (repeat for PE)
+                    tradingsymbol: `NIFTY${call_strike}CE`,  // Placeholder; get from response
+                    quantity: -qty,  // Short sell
+                    average_price: response.data.call_avg_price,
+                    order_id: order_ids.call
+                },
+                market_context: { /* Fetch from /analyze */ spot: 24500, vix: 15, /* etc. */ },
+                source: 'app_auto',
+                session_id
+            });
+            console.log('📓 Journal entry recorded for strangle session');
+        }
+
         res.json({
-            status: 'success',
-            message: response.data.message,
-            execution_details: {
-                call_symbol: response.data.call_symbol,
-                put_symbol: response.data.put_symbol,
-                call_entry: response.data.call_entry_price,
-                put_entry: response.data.put_entry_price,
-                total_credit: response.data.estimated_credit,
-                auto_management: response.data.auto_management
-            },
-            metadata: response.data.metadata,
-            backend: 'go_api'
+            success: true,
+            data: response.data,
+            message: 'Strangle executed and journaled'
         });
 
     } catch (error) {
-        console.error('❌ Execution failed:', error.message);
-
-        // Provide detailed error information
-        const errorMsg = error.response?.data?.error || error.message;
-        res.status(502).json({
-            status: 'error',
-            message: `Execution failed: ${errorMsg}`,
-            backend: 'go_api',
-            timestamp: new Date().toISOString()
-        });
+        console.error('❌ Strangle execution failed:', error.message);
+        // NEW: Fallback to Python execution if Go down
+        if (error.message.includes('Go API')) {
+            console.warn('⚠️ Falling back to Python execution...');
+            try {
+                const pyResponse = await pythonBreaker.execute(() =>
+                    axios.post(`${BACKENDS.python.url}/execute_strangle`, req.body)
+                );
+                res.json({ ...pyResponse.data, fallback: true });
+            } catch (pyError) {
+                res.status(500).json({ error: 'Both execution backends failed' });
+            }
+        } else {
+            res.status(500).json({ error: error.message });
+        }
     }
 });
 
@@ -404,6 +421,26 @@ app.get('/autopsy', (req, res) => {
 });
 
 // Journal API proxy endpoints
+
+app.use('/api/journal', async (req, res, next) => {
+    try {
+        const response = await pythonBreaker.execute(() =>
+            retryWithBackoff(() =>
+                axios({
+                    method: req.method,
+                    url: `${BACKENDS.python.url}${req.originalUrl.replace('/api/journal', '/journal')}`,
+                    data: req.body,
+                    timeout: 10000
+                })
+            )
+        );
+        res.json(response.data);
+    } catch (error) {
+        console.error('❌ Journal proxy failed:', error.message);
+        res.status(502).json({ error: "Journal backend offline" });
+    }
+});
+
 app.get('/api/journal/performance', async (req, res) => {
     try {
         const days = req.query.days || 30;

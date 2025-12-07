@@ -16,11 +16,12 @@ import asyncio
 import httpx
 import uuid
 
+
 from fastapi.responses import StreamingResponse
 import asyncio
 from fastapi.middleware.cors import CORSMiddleware
 from trade_autopsy import TradeAutopsy, get_trade_autopsy
-
+from fastapi import FastAPI, HTTPException, Body, Request, BackgroundTasks, Query  # ✅ Add Query
 
 
 # --- CONFIGURATION ---
@@ -160,13 +161,6 @@ async def stream_positions():
         }
     )
 
-
-# ============================================
-# FIXED POSITIONS ENDPOINT
-# Replace your existing @app.get("/positions") endpoint
-# Daily closed positions tracker (in-memory for the session)
-# ============================================
-
 @app.get("/positions")
 async def get_positions(request: Request):
     """
@@ -269,9 +263,6 @@ async def get_positions(request: Request):
             "source": "python",
             "timestamp": get_ist_time().strftime("%H:%M:%S")
         }
-
-
-
 # ============================================
 # HEALTH CHECK ENDPOINT
 # ============================================

@@ -1,8 +1,9 @@
 const express = require('express');
 const axios = require('axios');
-const path = require('path'); 
+const path = require('path');
 const app = express();
 const PORT = 3000;
+const fs = require('fs');
 
 
 app.use(express.json());
@@ -99,7 +100,7 @@ async function retryWithBackoff(fn, maxRetries = 3) {
             return await fn();
         } catch (error) {
             if (attempt === maxRetries) throw error;
-            
+
             const delay = Math.min(1000 * Math.pow(2, attempt), 10000);
             console.log(`Retry ${attempt}/${maxRetries} after ${delay}ms...`);
             await new Promise(resolve => setTimeout(resolve, delay));
@@ -206,7 +207,7 @@ app.get('/positions', async (req, res) => {
 
             } catch (pythonError) {
                 console.error('❌ Both backends failed!');
-                
+
                 // Return cached data if available
                 if (lastKnownPositions) {
                     return res.json({
@@ -306,6 +307,16 @@ app.post('/execute_strangle', async (req, res) => {
         } else {
             res.status(500).json({ error: error.message });
         }
+    }
+});
+
+app.get('/api/journal/historical_pnl', async (req, res) => {
+    try {
+        const { start, end } = req.query;
+        const response = await axios.get(`${BACKENDS.python.url}/api/journal/historical_pnl?start_date=${start}&end_date=${end}`);
+        res.json(response.data);
+    } catch (error) {
+        res.status(502).json({ error: "Historical P&L unavailable" });
     }
 });
 
@@ -504,6 +515,8 @@ app.get('/journal', (req, res) => {
 app.get('/autopsy', (req, res) => {
     res.redirect('/trading-app#autopsy');
 });
+
+
 
 app.get('/autopsy', (req, res) => {
     res.send(`
@@ -754,6 +767,8 @@ app.get('/autopsy', (req, res) => {
 </html>
     `);
 });
+
+
 
 // ============================================
 // HELPER FUNCTIONS
@@ -1029,24 +1044,31 @@ const getHtml = () => `
                 Live Positions
             </h3>
             
-            <div class="flex items-center gap-4">
-                <!-- Close All Button -->
-                <button onclick="closeAllPositions()" id="close-all-btn" class="px-4 py-2 bg-red-600 hover:bg-red-700 text-white text-sm font-bold rounded-lg transition shadow-lg hidden">
-                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 inline mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
-                    </svg>
-                    Close All
-                </button>
-                
-                <!-- Toggle Switch -->
-                <div class="flex items-center gap-2">
-                    <span class="text-xs text-slate-400">Show</span>
-                    <div class="relative inline-block w-10 h-6 align-middle select-none transition duration-200 ease-in">
-                        <input type="checkbox" name="togglePositions" id="positions-toggle" class="toggle-checkbox absolute block w-6 h-6 rounded-full bg-white border-4 appearance-none cursor-pointer" onclick="togglePositions()" checked />
-                        <label for="positions-toggle" class="toggle-label block overflow-hidden h-6 rounded-full bg-gray-600 cursor-pointer"></label>
-                    </div>
-                </div>
+           <div class="flex justify-between items-center p-4 border-b border-slate-700">
+    
+    <div class="flex items-center gap-4">        
+        <!-- Close All Button -->
+        <button 
+            onclick="closeAllPositions()" 
+            id="close-all-btn" 
+            class="px-4 py-2 bg-red-600 hover:bg-red-700 text-white text-sm font-bold rounded-lg transition shadow-lg hidden"
+        >
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 inline mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+            </svg>
+            Close All
+        </button>
+        
+        <!-- Toggle Switch -->
+        <div class="flex items-center gap-2">
+            <span class="text-xs text-slate-400">Show</span>
+            <div class="relative inline-block w-10 h-6 align-middle select-none transition duration-200 ease-in">
+                <input type="checkbox" name="togglePositions" id="positions-toggle" class="toggle-checkbox absolute block w-6 h-6 rounded-full bg-white border-4 appearance-none cursor-pointer" onclick="togglePositions()" checked />
+                <label for="positions-toggle" class="toggle-label block overflow-hidden h-6 rounded-full bg-gray-600 cursor-pointer"></label>
             </div>
+        </div>
+    </div>
+</div>
         </div>
         
         <!-- Scrollable Container -->
@@ -1473,6 +1495,17 @@ const getHtml = () => `
             } catch (error) {
                 alert('❌ Failed to close positions: ' + error.message);
             }
+        }
+        
+        function renderPastPerformanceButton() {
+            return \`
+                <button 
+                    onclick="window.location.href='/past-performance'" 
+                    class="ml-2 px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg font-medium transition shadow-lg"
+                >
+                    📈 Past Performance
+                </button>
+            \`;
         }
 
 
